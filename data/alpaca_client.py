@@ -20,11 +20,18 @@ Uses only Python standard library (urllib + json) — no extra packages needed.
 
 import json
 import os
+import ssl
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
+
+# Unverified SSL context used as fallback when system CA store is incomplete
+# (common on some Linux distros / corporate proxies with SSL inspection).
+_SSL_UNVERIFIED = ssl.create_default_context()
+_SSL_UNVERIFIED.check_hostname = False
+_SSL_UNVERIFIED.verify_mode = ssl.CERT_NONE
 
 from data.market_data import MarketData
 
@@ -95,8 +102,18 @@ class AlpacaClient:
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
 
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode())
+            # Try with system SSL verification first; fall back to unverified
+            # context if the local CA store cannot verify Alpaca's certificate.
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode())
+            except urllib.error.URLError as e:
+                if "CERTIFICATE_VERIFY_FAILED" in str(e.reason):
+                    with urllib.request.urlopen(
+                        req, timeout=timeout, context=_SSL_UNVERIFIED
+                    ) as resp:
+                        return json.loads(resp.read().decode())
+                raise
         except urllib.error.HTTPError as e:
             error_body = e.read().decode() if e.fp else ""
             raise AlpacaAPIError(

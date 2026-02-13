@@ -151,30 +151,100 @@ def rho(S: float, K: float, T: float, r: float, sigma: float,
         return -K * T * math.exp(-r * T) * _norm_cdf(-d2) / 100.0
 
 
+# ── Second-Order Greeks ───────────────────────────────────────────────────────
+
+def charm(S: float, K: float, T: float, r: float, sigma: float,
+          option_type: str = "call") -> float:
+    """Option Charm (Delta Decay / DdeltaDtime): rate of change of delta w.r.t. time.
+
+    Measures how much delta bleeds daily as time passes (important near expiry).
+    Returned as daily charm (divided by 365). Same formula for calls and puts
+    (by put-call parity, charm_call == charm_put since delta_put = delta_call - 1).
+
+    Pseudocode:
+        charm = -N'(d1) * (2*r*T - d2*sigma*sqrt(T)) / (2*T*sigma*sqrt(T))
+        charm_daily = charm / 365
+    """
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1, d2 = _d1_d2(S, K, T, r, sigma)
+    sqrtT = math.sqrt(T)
+    annual_charm = -_norm_pdf(d1) * (2.0 * r * T - d2 * sigma * sqrtT) / (2.0 * T * sigma * sqrtT)
+    return annual_charm / 365.0
+
+
+def vanna(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """Option Vanna: sensitivity of delta to volatility (= sensitivity of vega to spot).
+
+    Vanna = ∂Delta/∂sigma = ∂Vega/∂S
+    Returned per 1% change in volatility (divided by 100). Same for calls and puts.
+
+    Key use: if vanna > 0, rising vol increases delta → useful for hedging.
+
+    Pseudocode:
+        vanna = -N'(d1) * d2 / sigma   (raw)
+        vanna_per_1pct = vanna / 100
+    """
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1, d2 = _d1_d2(S, K, T, r, sigma)
+    return -_norm_pdf(d1) * d2 / sigma / 100.0
+
+
+def vomma(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """Option Vomma (Volga): rate of change of vega w.r.t. volatility.
+
+    Vomma = ∂Vega/∂sigma = Vega * d1 * d2 / sigma
+    Returned per 1% change in vol (divided by 100). Same for calls and puts.
+
+    Key use: positive vomma means long vol convexity (gains accelerate as vol rises).
+    Iron condors have negative vomma (hurt by vol expansion).
+
+    Pseudocode:
+        raw_vega = S * N'(d1) * sqrt(T)
+        vomma = raw_vega * d1 * d2 / sigma   (raw)
+        vomma_per_1pct = vomma / 100
+    """
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1, d2 = _d1_d2(S, K, T, r, sigma)
+    raw_vega = S * _norm_pdf(d1) * math.sqrt(T)
+    return raw_vega * d1 * d2 / sigma / 100.0
+
+
 @dataclass
 class GreeksResult:
-    """All Greeks for a single option."""
+    """All Greeks for a single option (first and second order)."""
     delta: float
     gamma: float
-    theta: float  # daily
-    vega: float   # per 1% vol move
-    rho: float    # per 1% rate move
+    theta: float   # daily
+    vega: float    # per 1% vol move
+    rho: float     # per 1% rate move
+    # Second-order Greeks
+    charm: float = 0.0   # daily delta decay (∂Delta/∂t)
+    vanna: float = 0.0   # delta sensitivity to vol (∂Delta/∂sigma), per 1%
+    vomma: float = 0.0   # vega sensitivity to vol (∂Vega/∂sigma), per 1%
 
     def __repr__(self):
         return (f"Greeks(Δ={self.delta:+.4f}, Γ={self.gamma:.4f}, "
                 f"Θ={self.theta:+.4f}/day, V={self.vega:.4f}/1%vol, "
-                f"ρ={self.rho:+.4f}/1%rate)")
+                f"ρ={self.rho:+.4f}/1%rate | "
+                f"charm={self.charm:+.6f}/day, vanna={self.vanna:+.4f}/1%vol, "
+                f"vomma={self.vomma:.4f}/1%vol)")
 
 
 def all_greeks(S: float, K: float, T: float, r: float, sigma: float,
                option_type: str = "call") -> GreeksResult:
-    """Calculate all Greeks at once."""
+    """Calculate all Greeks at once (first and second order)."""
     return GreeksResult(
         delta=delta(S, K, T, r, sigma, option_type),
         gamma=gamma(S, K, T, r, sigma),
         theta=theta(S, K, T, r, sigma, option_type),
         vega=vega(S, K, T, r, sigma),
         rho=rho(S, K, T, r, sigma, option_type),
+        charm=charm(S, K, T, r, sigma, option_type),
+        vanna=vanna(S, K, T, r, sigma),
+        vomma=vomma(S, K, T, r, sigma),
     )
 
 

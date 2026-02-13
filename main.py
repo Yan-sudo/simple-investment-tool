@@ -29,6 +29,8 @@
         wheel     Wheel Strategy (轮动策略)
         straddle  Long Straddle/Strangle (跨式/宽跨式)
         adaptive  IV-Adaptive (IV自适应策略)
+        butterfly Long Call Butterfly (蝶式策略)
+        pcr_ic    PCR+VIX-Band Enhanced Iron Condor (PCR增强型铁鹰)
 """
 
 import sys
@@ -106,6 +108,7 @@ def _load_option_strategies():
     from options.strategies import (
         IronCondorStrategy, VerticalSpreadStrategy, WheelStrategy,
         StraddleStrategy, IVAdaptiveStrategy,
+        ButterflySpreadStrategy, PCREnhancedStrategy,
     )
 
     OPTION_STRATEGIES.update({
@@ -147,6 +150,24 @@ def _load_option_strategies():
             "default_params": {
                 "high_iv_threshold": 60.0, "low_iv_threshold": 25.0,
                 "dte_target": 30,
+            },
+        },
+        "butterfly": {
+            "class": ButterflySpreadStrategy,
+            "name": "Long Call Butterfly",
+            "default_params": {
+                "low_iv_threshold": 10.0, "high_iv_threshold": 70.0,
+                "dte_target": 35, "wing_width": 5.0,
+                "profit_target": 0.75,
+            },
+        },
+        "pcr_ic": {
+            "class": PCREnhancedStrategy,
+            "name": "PCR-Enhanced Iron Condor",
+            "default_params": {
+                "iv_rank_entry": 50.0, "dte_target": 45,
+                "short_delta": 0.16, "wing_width": 5.0,
+                "require_pcr": True, "require_vix_band": True,
             },
         },
     })

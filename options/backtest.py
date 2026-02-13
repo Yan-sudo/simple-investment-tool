@@ -103,6 +103,9 @@ class OptionBacktestResult:
     wash_sale_violations: int = 0
     wash_sale_disallowed: float = 0.0
     risk_snapshot: Optional[PortfolioRisk] = None
+    # v3 additions
+    calmar_ratio: float = 0.0         # Annualized return / max drawdown
+    max_consecutive_losses: int = 0   # Longest losing streak
 
 
 class OptionBacktestEngine:
@@ -537,6 +540,25 @@ class OptionBacktestEngine:
         total_collected = sum(t.net_credit for t in trades if t.net_credit > 0)
         total_paid = sum(abs(t.net_credit) for t in trades if t.net_credit < 0)
 
+        # Calmar Ratio = annualized_return / max_drawdown
+        # Measures return per unit of max peak-to-trough loss.
+        # Higher is better; > 1.0 is generally good.
+        calmar = (annualized_return * 100) / max_dd if max_dd > 0 else 0.0
+
+        # Max consecutive losses — important for psychological/margin risk
+        # Pseudocode:
+        #   streak = 0; max_streak = 0
+        #   for each trade: if loss → streak += 1 else streak = 0
+        #   max_streak = max(max_streak, streak)
+        max_consec = 0
+        streak = 0
+        for t in trades:
+            if t.exit_pnl <= 0:
+                streak += 1
+                max_consec = max(max_consec, streak)
+            else:
+                streak = 0
+
         return {
             "total_pnl": total_pnl,
             "total_return_pct": total_return_pct,
@@ -551,6 +573,8 @@ class OptionBacktestEngine:
             "avg_holding_days": avg_holding,
             "total_premium_collected": total_collected,
             "total_premium_paid": total_paid,
+            "calmar_ratio": calmar,
+            "max_consecutive_losses": max_consec,
         }
 
 
@@ -590,6 +614,8 @@ def generate_option_report(result: OptionBacktestResult) -> str:
     lines.append(f"  Max Drawdown:    {result.max_drawdown_pct:>12.2f}%")
     lines.append(f"  Sharpe Ratio:    {result.sharpe_ratio:>12.2f}")
     lines.append(f"  Sortino Ratio:   {result.sortino_ratio:>12.2f}")
+    lines.append(f"  Calmar Ratio:    {result.calmar_ratio:>12.2f}")
+    lines.append(f"  Max Consec Loss: {result.max_consecutive_losses:>12d}")
     lines.append("")
 
     # Transaction cost analysis
@@ -722,6 +748,8 @@ def compare_option_strategies(results: List[OptionBacktestResult]) -> str:
         ("Annualized Return %", [f"{r.annualized_return_pct:+.2f}%" for r in results]),
         ("Sharpe Ratio", [f"{r.sharpe_ratio:.2f}" for r in results]),
         ("Sortino Ratio", [f"{r.sortino_ratio:.2f}" for r in results]),
+        ("Calmar Ratio", [f"{r.calmar_ratio:.2f}" for r in results]),
+        ("Max Consec Losses", [f"{r.max_consecutive_losses}" for r in results]),
         ("Max Drawdown %", [f"{r.max_drawdown_pct:.2f}%" for r in results]),
         ("Win Rate %", [f"{r.win_rate:.1f}%" for r in results]),
         ("Profit Factor", [f"{r.profit_factor:.2f}" for r in results]),

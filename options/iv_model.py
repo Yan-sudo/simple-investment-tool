@@ -10,7 +10,7 @@ Provides tools for analyzing volatility:
 
 import math
 from typing import List, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 def historical_volatility(closes: List[float], window: int = 20) -> List[float]:
@@ -314,3 +314,183 @@ def generate_iv_signals(iv_series: List[float], hv_series: List[float],
             ))
 
     return signals
+
+
+# ── Put/Call Ratio (PCR) Signal ─────────────────────────────────────────────
+# Inspired by: PyPatel/Options-Trading-Strategies-in-Python (PCR_strategy.py)
+# PCR = total put volume / total call volume
+# - High PCR (>1.2): heavy put buying = fear = contrarian BULLISH
+# - Low PCR (<0.5): heavy call buying = complacency = contrarian BEARISH
+# Entry: PCR crosses Bollinger Band boundary
+# Exit: PCR reverts to 20-day moving average
+
+@dataclass
+class PCRSignal:
+    """Signal generated from Put/Call Ratio Bollinger Band analysis."""
+    signal: int          # 1 = contrarian bullish, -1 = contrarian bearish, 0 = neutral
+    pcr_current: float
+    pcr_mean: float
+    pcr_upper: float     # Bollinger upper band
+    pcr_lower: float     # Bollinger lower band
+    reason: str
+
+    def __repr__(self):
+        labels = {1: "CONTRARIAN_BULL", -1: "CONTRARIAN_BEAR", 0: "NEUTRAL"}
+        return (f"PCRSignal({labels[self.signal]}: "
+                f"PCR={self.pcr_current:.2f} vs bands "
+                f"[{self.pcr_lower:.2f}, {self.pcr_upper:.2f}])")
+
+
+def generate_pcr_series(closes: List[float], iv_series: List[float],
+                        base_pcr: float = 0.70,
+                        seed: Optional[int] = None) -> List[float]:
+    """Generate a synthetic Put/Call Ratio time series.
+
+    PCR properties:
+    - Mean-reverting around base_pcr (~0.7 for equity markets)
+    - Positively correlated with IV (more fear → more put buying)
+    - Negatively correlated with daily returns (sell-off → PCR spikes)
+    - Range: 0.3 – 2.5
+
+    Args:
+        closes: Underlying price history
+        iv_series: Implied volatility series (for correlation)
+        base_pcr: Long-run mean PCR (equity markets ~0.70)
+        seed: Random seed
+
+    Returns:
+        List of daily PCR values
+    """
+    import random as rng
+    if seed is not None:
+        rng.seed(seed + 77)  # offset from iv_series seed
+
+    n = len(closes)
+    pcr = [base_pcr] * n
+    pcr_vol = 0.06  # daily noise
+
+    for i in range(1, n):
+        prev = pcr[i - 1]
+
+        # Mean reversion pull (slow)
+        mr = 0.06 * (base_pcr - prev) / 252.0 * 100
+
+        # IV coupling: elevated IV → more put buying → higher PCR
+        iv_now = iv_series[i] if i < len(iv_series) else 0.20
+        iv_effect = (iv_now - 0.20) * 0.8  # PCR rises ~0.008 per 1% IV spike
+
+        # Return coupling: negative returns spike PCR
+        ret = 0.0
+        if closes[i - 1] > 0:
+            ret = (closes[i] - closes[i - 1]) / closes[i - 1]
+        return_effect = -ret * 4.0  # amplified leverage
+
+        shock = rng.gauss(0, pcr_vol / math.sqrt(252))
+
+        new_pcr = prev + mr + iv_effect * 0.01 + return_effect + shock
+        pcr[i] = max(0.30, min(new_pcr, 2.50))
+
+    return pcr
+
+
+def generate_pcr_signals(pcr_series: List[float], window: int = 20,
+                         num_std: float = 2.0) -> List[PCRSignal]:
+    """Generate contrarian options signals from PCR Bollinger Bands.
+
+    Strategy (adapted from PyPatel PCR_strategy.py):
+      - PCR > upper_band → extreme fear → contrarian BULLISH → sell puts (good IV)
+      - PCR < lower_band → complacency → contrarian BEARISH → sell calls (good IV)
+      - PCR reverts to mean → exit signal / close position
+
+    For options context:
+      signal=+1 (high PCR): Good time to sell put spreads or cash-secured puts
+      signal=-1 (low PCR):  Good time to sell call spreads or iron condors
+      signal=0:             No PCR-based edge
+
+    Args:
+        pcr_series: Daily PCR values
+        window: Bollinger Band window (default 20 days)
+        num_std: Number of standard deviations for bands (default 2.0)
+
+    Returns:
+        List of PCRSignal, one per day
+    """
+    n = len(pcr_series)
+    signals = []
+
+    for i in range(n):
+        if i < window:
+            signals.append(PCRSignal(
+                signal=0, pcr_current=pcr_series[i],
+                pcr_mean=0.70, pcr_upper=1.0, pcr_lower=0.40,
+                reason="Insufficient data"
+            ))
+            continue
+
+        window_data = pcr_series[i - window:i]
+        mean = sum(window_data) / len(window_data)
+        std = math.sqrt(
+            sum((x - mean) ** 2 for x in window_data) / max(len(window_data) - 1, 1)
+        )
+        upper = mean + num_std * std
+        lower = max(0.20, mean - num_std * std)
+        current = pcr_series[i]
+
+        if current > upper:
+            signals.append(PCRSignal(
+                signal=1, pcr_current=current,
+                pcr_mean=mean, pcr_upper=upper, pcr_lower=lower,
+                reason=f"PCR {current:.2f} above upper band {upper:.2f}: extreme fear → contrarian bull"
+            ))
+        elif current < lower:
+            signals.append(PCRSignal(
+                signal=-1, pcr_current=current,
+                pcr_mean=mean, pcr_upper=upper, pcr_lower=lower,
+                reason=f"PCR {current:.2f} below lower band {lower:.2f}: complacency → contrarian bear"
+            ))
+        else:
+            signals.append(PCRSignal(
+                signal=0, pcr_current=current,
+                pcr_mean=mean, pcr_upper=upper, pcr_lower=lower,
+                reason=f"PCR {current:.2f} within bands [{lower:.2f}, {upper:.2f}]: neutral"
+            ))
+
+    return signals
+
+
+def generate_vix_bands(iv_series: List[float], window: int = 20,
+                       num_std: float = 1.5) -> List[Tuple[float, float, float]]:
+    """Compute Bollinger Bands on the IV series (VIX-style band analysis).
+
+    Strategy (adapted from PyPatel VIX_Strategy.py):
+      - IV crosses above upper band → vol spike → sell premium aggressively
+      - IV crosses below lower band → vol crush → buy volatility (straddles)
+      - IV reverts to mean → reduce premium-selling, look to close shorts
+
+    Args:
+        iv_series: Daily implied volatility values
+        window: Rolling window for mean/std (default 20)
+        num_std: Multiplier for band width (default 1.5 σ)
+
+    Returns:
+        List of (mean_iv, upper_band, lower_band) tuples, one per day
+    """
+    n = len(iv_series)
+    bands: List[Tuple[float, float, float]] = []
+
+    for i in range(n):
+        if i < window:
+            v = iv_series[i]
+            bands.append((v, v * 1.25, max(0.05, v * 0.75)))
+            continue
+
+        window_data = iv_series[i - window:i]
+        mean = sum(window_data) / len(window_data)
+        std = math.sqrt(
+            sum((x - mean) ** 2 for x in window_data) / max(len(window_data) - 1, 1)
+        )
+        upper = mean + num_std * std
+        lower = max(0.05, mean - num_std * std)
+        bands.append((mean, upper, lower))
+
+    return bands

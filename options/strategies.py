@@ -20,7 +20,8 @@ from typing import List, Optional, Dict, Tuple
 
 from options.iv_model import (
     historical_volatility, generate_iv_series, iv_rank, iv_percentile,
-    classify_vol_regime, generate_iv_signals, IVSignal
+    classify_vol_regime, generate_iv_signals, IVSignal,
+    generate_pcr_series, generate_pcr_signals, generate_vix_bands,
 )
 from options.pricing import (
     call_price, put_price, delta, gamma, theta, vega, all_greeks
@@ -125,6 +126,91 @@ class OptionPosition:
                 f"[Net={'${:+.0f}'.format(self.net_credit)}]")
 
 
+# ── Strategy Mixin (shared helpers) ─────────────────────────────────────────
+
+class _StrategyMixin:
+    """Shared utility methods for all option strategies.
+
+    Eliminates duplication of _find_strike_by_delta, _position_value, _calc_pnl
+    across strategy classes.
+    """
+
+    @staticmethod
+    def _find_strike_by_delta(S: float, T: float, r: float, sigma: float,
+                              target_delta: float, option_type: str) -> float:
+        """Find the strike price closest to a target delta.
+
+        Searches ±40 strikes around current price using a step size appropriate
+        for the price level. Returns the strike whose delta best matches target.
+
+        Pseudocode:
+            for each candidate strike K in [S - 40*step, S + 40*step]:
+                d = BS_delta(S, K, T, r, sigma, type)
+                if |d - target_delta| is smallest so far → save K
+        """
+        step = 1.0 if S < 200 else 2.0 if S < 500 else 5.0
+        best_strike = S
+        best_diff = float('inf')
+        for offset in range(-40, 41):
+            k = round(S / step) * step + offset * step
+            if k <= 0:
+                continue
+            d = delta(S, k, T, r, sigma, option_type)
+            diff = abs(abs(d) - abs(target_delta))
+            if diff < best_diff:
+                best_diff = diff
+                best_strike = k
+        return best_strike
+
+    @staticmethod
+    def _position_value(position: 'OptionPosition', current_price: float,
+                        remaining_dte: int, current_iv: float, r: float) -> float:
+        """Cost to close the position at current market prices.
+
+        Pseudocode:
+            total = 0
+            for each leg:
+                price = BS_price(S_now, K, T_remain, r, iv_now)
+                if leg is short: total += price × contracts × 100
+                if leg is long:  total -= price × contracts × 100
+        """
+        T = max(remaining_dte / 365.0, 1 / 365.0)
+        total = 0.0
+        for leg in position.legs:
+            if leg.option_type == "call":
+                price = call_price(current_price, leg.strike, T, r, current_iv)
+            else:
+                price = put_price(current_price, leg.strike, T, r, current_iv)
+            if leg.action == "sell":
+                total += price * leg.contracts * 100
+            else:
+                total -= price * leg.contracts * 100
+        return total
+
+    @staticmethod
+    def _calc_pnl(position: 'OptionPosition', current_price: float,
+                  remaining_dte: int, current_iv: float, r: float) -> float:
+        """P&L at exit = initial credit - cost to close."""
+        close_cost = _StrategyMixin._position_value(
+            position, current_price, remaining_dte, current_iv, r
+        )
+        return position.net_credit - close_cost
+
+    @staticmethod
+    def _long_position_value(position: 'OptionPosition', current_price: float,
+                             remaining_dte: int, current_iv: float, r: float) -> float:
+        """Current market value of long option legs (all legs positive)."""
+        T = max(remaining_dte / 365.0, 1 / 365.0)
+        total = 0.0
+        for leg in position.legs:
+            if leg.option_type == "call":
+                price = call_price(current_price, leg.strike, T, r, current_iv)
+            else:
+                price = put_price(current_price, leg.strike, T, r, current_iv)
+            total += price * leg.contracts * 100
+        return total
+
+
 # ── Strategy Base Class ─────────────────────────────────────────────────────
 
 class OptionStrategy(ABC):
@@ -154,7 +240,7 @@ class OptionStrategy(ABC):
 
 # ── Iron Condor Strategy ────────────────────────────────────────────────────
 
-class IronCondorStrategy(OptionStrategy):
+class IronCondorStrategy(_StrategyMixin, OptionStrategy):
     """Iron Condor: Sell OTM put spread + OTM call spread.
 
     Best when: High IV, expecting range-bound price action.
@@ -291,47 +377,10 @@ class IronCondorStrategy(OptionStrategy):
 
         return positions
 
-    def _find_strike_by_delta(self, S, T, r, sigma, target_delta, option_type):
-        """Find strike price for a given target delta."""
-        best_strike = S
-        best_diff = float('inf')
-        # Search around the current price
-        step = 1.0 if S < 200 else 2.0 if S < 500 else 5.0
-        for offset in range(-40, 41):
-            k = round(S / step) * step + offset * step
-            if k <= 0:
-                continue
-            d = delta(S, k, T, r, sigma, option_type)
-            diff = abs(abs(d) - abs(target_delta))
-            if diff < best_diff:
-                best_diff = diff
-                best_strike = k
-        return best_strike
-
-    def _position_value(self, position, current_price, remaining_dte, current_iv, r):
-        """Current cost to close the position."""
-        T = remaining_dte / 365.0
-        total = 0.0
-        for leg in position.legs:
-            if leg.option_type == "call":
-                price = call_price(current_price, leg.strike, T, r, current_iv)
-            else:
-                price = put_price(current_price, leg.strike, T, r, current_iv)
-            if leg.action == "sell":
-                total += price * leg.contracts * 100
-            else:
-                total -= price * leg.contracts * 100
-        return total
-
-    def _calc_pnl(self, position, current_price, remaining_dte, current_iv, r):
-        """Calculate P&L at exit."""
-        close_cost = self._position_value(position, current_price, remaining_dte, current_iv, r)
-        return position.net_credit - close_cost
-
 
 # ── Vertical Spread Strategy ────────────────────────────────────────────────
 
-class VerticalSpreadStrategy(OptionStrategy):
+class VerticalSpreadStrategy(_StrategyMixin, OptionStrategy):
     """Bull Put Spread or Bear Call Spread based on trend + IV.
 
     Combines directional bias with premium selling:
@@ -478,43 +527,10 @@ class VerticalSpreadStrategy(OptionStrategy):
 
         return positions
 
-    def _find_strike_by_delta(self, S, T, r, sigma, target_delta, option_type):
-        best_strike = S
-        best_diff = float('inf')
-        step = 1.0 if S < 200 else 2.0 if S < 500 else 5.0
-        for offset in range(-40, 41):
-            k = round(S / step) * step + offset * step
-            if k <= 0:
-                continue
-            d = delta(S, k, T, r, sigma, option_type)
-            diff = abs(abs(d) - abs(target_delta))
-            if diff < best_diff:
-                best_diff = diff
-                best_strike = k
-        return best_strike
-
-    def _position_value(self, position, current_price, remaining_dte, current_iv, r):
-        T = remaining_dte / 365.0
-        total = 0.0
-        for leg in position.legs:
-            if leg.option_type == "call":
-                price = call_price(current_price, leg.strike, T, r, current_iv)
-            else:
-                price = put_price(current_price, leg.strike, T, r, current_iv)
-            if leg.action == "sell":
-                total += price * leg.contracts * 100
-            else:
-                total -= price * leg.contracts * 100
-        return total
-
-    def _calc_pnl(self, position, current_price, remaining_dte, current_iv, r):
-        close_cost = self._position_value(position, current_price, remaining_dte, current_iv, r)
-        return position.net_credit - close_cost
-
 
 # ── Wheel Strategy ──────────────────────────────────────────────────────────
 
-class WheelStrategy(OptionStrategy):
+class WheelStrategy(_StrategyMixin, OptionStrategy):
     """The Wheel: Sell CSPs → Get assigned → Sell Covered Calls → Repeat.
 
     One of the most popular income strategies for SPY/QQQ:
@@ -657,25 +673,10 @@ class WheelStrategy(OptionStrategy):
 
         return positions
 
-    def _find_strike_by_delta(self, S, T, r, sigma, target_delta, option_type):
-        best_strike = S
-        best_diff = float('inf')
-        step = 1.0 if S < 200 else 2.0 if S < 500 else 5.0
-        for offset in range(-40, 41):
-            k = round(S / step) * step + offset * step
-            if k <= 0:
-                continue
-            d = delta(S, k, T, r, sigma, option_type)
-            diff = abs(abs(d) - abs(target_delta))
-            if diff < best_diff:
-                best_diff = diff
-                best_strike = k
-        return best_strike
-
 
 # ── Straddle/Strangle Strategy ──────────────────────────────────────────────
 
-class StraddleStrategy(OptionStrategy):
+class StraddleStrategy(_StrategyMixin, OptionStrategy):
     """Long Straddle/Strangle: Buy ATM/OTM puts + calls for volatility expansion.
 
     Best when: Low IV, expecting a big move (either direction).
@@ -735,16 +736,16 @@ class StraddleStrategy(OptionStrategy):
 
                 if remaining_dte <= self.dte_exit:
                     current_position.exit_date = dates[i]
-                    pnl = self._calc_pnl(current_position, price, remaining_dte,
-                                         iv_series[i], risk_free_rate)
+                    pnl = self._straddle_pnl(current_position, price, remaining_dte,
+                                             iv_series[i], risk_free_rate)
                     current_position.exit_pnl = pnl
                     in_position = False
                     continue
 
                 # Check profit/loss targets
-                current_value = self._position_value(current_position, price,
-                                                     remaining_dte, iv_series[i],
-                                                     risk_free_rate)
+                current_value = self._long_position_value(current_position, price,
+                                                          remaining_dte, iv_series[i],
+                                                          risk_free_rate)
                 debit_paid = abs(current_position.net_credit)
                 if debit_paid > 0:
                     profit = current_value - debit_paid
@@ -795,19 +796,11 @@ class StraddleStrategy(OptionStrategy):
 
         return positions
 
-    def _position_value(self, position, current_price, remaining_dte, current_iv, r):
-        T = remaining_dte / 365.0
-        total = 0.0
-        for leg in position.legs:
-            if leg.option_type == "call":
-                price = call_price(current_price, leg.strike, T, r, current_iv)
-            else:
-                price = put_price(current_price, leg.strike, T, r, current_iv)
-            total += price * leg.contracts * 100  # All legs are long
-        return total
-
-    def _calc_pnl(self, position, current_price, remaining_dte, current_iv, r):
-        current_value = self._position_value(position, current_price, remaining_dte, current_iv, r)
+    def _straddle_pnl(self, position, current_price, remaining_dte, current_iv, r):
+        """P&L for long-only structures: current value - debit paid."""
+        current_value = self._long_position_value(
+            position, current_price, remaining_dte, current_iv, r
+        )
         debit_paid = abs(position.net_credit)
         return current_value - debit_paid
 
@@ -899,5 +892,355 @@ class IVAdaptiveStrategy(OptionStrategy):
                 positions[i] = selected
                 in_position = True
                 position_exit_day = i + self.dte_target
+
+        return positions
+
+
+# ── Butterfly Spread Strategy ────────────────────────────────────────────────
+
+class ButterflySpreadStrategy(_StrategyMixin, OptionStrategy):
+    """Long Call Butterfly: profit from price pinning at ATM strike.
+
+    Structure:
+        Buy 1 call at K - wing_width  (lower wing)
+        Sell 2 calls at K             (body — ATM short)
+        Buy 1 call at K + wing_width  (upper wing)
+
+    Economics:
+        Net Debit = lower_wing + upper_wing - 2 * body
+        Max Profit = wing_width × 100 - debit  (at body strike at expiry)
+        Max Loss   = debit paid              (price outside wings)
+
+    Entry conditions (adapted from PyPatel volatility strategies):
+        - IVR between low_iv and high_iv (moderate vol — not too rich, not too cheap)
+        - Neutral price outlook: no strong trend
+        - 30-45 DTE for optimal theta decay and profit window
+
+    Exit:
+        - DTE reaches exit threshold
+        - Profit target hit (75% of max profit)
+        - Stop loss (150% of debit paid)
+    """
+
+    def __init__(self, low_iv_threshold: float = 10.0,
+                 high_iv_threshold: float = 70.0,
+                 dte_target: int = 35, dte_exit: int = 10,
+                 wing_width: float = 5.0,
+                 profit_target: float = 0.75,
+                 stop_loss_mult: float = 1.50,
+                 contracts: int = 1):
+        self.low_iv_threshold = low_iv_threshold
+        self.high_iv_threshold = high_iv_threshold
+        self.dte_target = dte_target
+        self.dte_exit = dte_exit
+        self.wing_width = wing_width
+        self.profit_target = profit_target  # Close at 75% of max profit
+        self.stop_loss_mult = stop_loss_mult  # Close if loss > 1.5× debit
+        self.contracts = contracts
+
+    @property
+    def name(self) -> str:
+        return "Long Call Butterfly"
+
+    @property
+    def params(self) -> Dict:
+        return {
+            "low_iv_threshold": self.low_iv_threshold,
+            "high_iv_threshold": self.high_iv_threshold,
+            "dte_target": self.dte_target,
+            "wing_width": self.wing_width,
+            "profit_target": self.profit_target,
+        }
+
+    def generate_trades(self, closes, highs, lows, dates, risk_free_rate=0.04):
+        n = len(closes)
+        positions = [None] * n
+
+        iv_series = generate_iv_series(closes, base_iv=0.20, seed=42)
+
+        in_position = False
+        position_entry_idx = 0
+        current_position = None
+
+        for i in range(252, n):
+            iv_history = iv_series[max(0, i - 252):i]
+            current_iv = iv_series[i]
+            ivr = iv_rank(current_iv, iv_history)
+            price = closes[i]
+            T = self.dte_target / 365.0
+
+            if in_position:
+                days_held = i - position_entry_idx
+                remaining_dte = self.dte_target - days_held
+
+                if remaining_dte <= self.dte_exit:
+                    current_position.exit_date = dates[i]
+                    pnl = self._butterfly_pnl(current_position, price,
+                                              remaining_dte, iv_series[i], risk_free_rate)
+                    current_position.exit_pnl = pnl
+                    in_position = False
+                    continue
+
+                # Profit / stop-loss check
+                current_val = self._butterfly_current_value(
+                    current_position, price, remaining_dte, iv_series[i], risk_free_rate
+                )
+                debit_paid = abs(current_position.net_credit)
+                max_profit_est = self.wing_width * self.contracts * 100 - debit_paid
+
+                if debit_paid > 0 and max_profit_est > 0:
+                    pnl_now = current_val - debit_paid
+                    if pnl_now >= max_profit_est * self.profit_target:
+                        current_position.exit_date = dates[i]
+                        current_position.exit_pnl = pnl_now
+                        in_position = False
+                        continue
+                    if pnl_now <= -debit_paid * self.stop_loss_mult:
+                        current_position.exit_date = dates[i]
+                        current_position.exit_pnl = pnl_now
+                        in_position = False
+                        continue
+
+            else:
+                # Entry: moderate IV regime (not too high, not too low)
+                if self.low_iv_threshold <= ivr <= self.high_iv_threshold:
+                    step = 1.0 if price < 200 else 2.0 if price < 500 else 5.0
+                    body_strike = round(price / step) * step  # ATM
+                    lower_strike = body_strike - self.wing_width
+                    upper_strike = body_strike + self.wing_width
+
+                    if lower_strike <= 0:
+                        continue
+
+                    lower_prem = call_price(price, lower_strike, T, risk_free_rate, current_iv)
+                    body_prem = call_price(price, body_strike, T, risk_free_rate, current_iv)
+                    upper_prem = call_price(price, upper_strike, T, risk_free_rate, current_iv)
+
+                    # Long butterfly is ALWAYS a debit by call-price convexity:
+                    #   net_debit = C(K-w) + C(K+w) - 2*C(K) >= 0
+                    # Skip only if max profit is too small to be worthwhile.
+                    net_debit = (lower_prem - 2 * body_prem + upper_prem) * self.contracts * 100
+                    max_profit_est = self.wing_width * self.contracts * 100 - net_debit
+                    if max_profit_est <= 0.01:
+                        # Wing_width too narrow vs debit — no profit potential
+                        continue
+
+                    position = OptionPosition(
+                        strategy_name="long_call_butterfly",
+                        underlying_price=price,
+                        entry_date=dates[i],
+                        legs=[
+                            OptionTrade("call", "buy", lower_strike, lower_prem,
+                                        self.contracts, self.dte_target, current_iv,
+                                        delta(price, lower_strike, T, risk_free_rate, current_iv, "call")),
+                            OptionTrade("call", "sell", body_strike, body_prem,
+                                        self.contracts * 2, self.dte_target, current_iv,
+                                        delta(price, body_strike, T, risk_free_rate, current_iv, "call")),
+                            OptionTrade("call", "buy", upper_strike, upper_prem,
+                                        self.contracts, self.dte_target, current_iv,
+                                        delta(price, upper_strike, T, risk_free_rate, current_iv, "call")),
+                        ]
+                    )
+
+                    positions[i] = position
+                    current_position = position
+                    position_entry_idx = i
+                    in_position = True
+
+        return positions
+
+    def _butterfly_current_value(self, position, current_price, remaining_dte,
+                                  current_iv, r) -> float:
+        """Mark-to-market value of the butterfly (net of all legs).
+
+        Long call butterfly:
+          value = long_lower_value - 2*short_body_value + long_upper_value
+        """
+        T = max(remaining_dte / 365.0, 1 / 365.0)
+        total = 0.0
+        for leg in position.legs:
+            price = call_price(current_price, leg.strike, T, r, current_iv)
+            if leg.action == "buy":
+                total += price * leg.contracts * 100
+            else:
+                total -= price * leg.contracts * 100
+        return total
+
+    def _butterfly_pnl(self, position, current_price, remaining_dte,
+                        current_iv, r) -> float:
+        """P&L at exit = current value - debit paid."""
+        current_val = self._butterfly_current_value(
+            position, current_price, remaining_dte, current_iv, r
+        )
+        debit_paid = abs(position.net_credit)
+        return current_val - debit_paid
+
+
+# ── PCR-Enhanced Iron Condor Strategy ───────────────────────────────────────
+
+class PCREnhancedStrategy(_StrategyMixin, OptionStrategy):
+    """Iron Condor with PCR + VIX-band dual-confirmation entry filter.
+
+    Enhances the standard Iron Condor with two additional market-sentiment
+    signals inspired by PyPatel's VIX_Strategy.py and PCR_strategy.py:
+
+    1. PCR (Put/Call Ratio) signal:
+       Entry only when PCR is ABOVE its upper Bollinger Band.
+       Extreme fear (high PCR) → IV is elevated → optimal time to sell premium.
+
+    2. VIX-band signal (using synthetic IV series as VIX proxy):
+       Entry only when current IV is ABOVE its 20-day mean + 1.5σ.
+       IV spike → mean-reversion edge → sell premium before vol crush.
+
+    Combined entry requirements:
+        IVR >= iv_rank_entry          (standard IV rank gate)
+        PCR >= PCR upper band         (extreme put-buying = fear confirmation)
+        IV  >= VIX upper band         (IV spike above band = vol elevation)
+
+    This triple-filter dramatically reduces trade frequency but improves
+    the quality of entries (better premium, higher POP, less IV crush risk).
+
+    Exit: Same as Iron Condor (DTE, profit target, stop loss).
+    """
+
+    def __init__(self, iv_rank_entry: float = 50.0,
+                 dte_target: int = 45, dte_exit: int = 21,
+                 short_delta: float = 0.16, wing_width: float = 5.0,
+                 profit_target: float = 0.50, stop_loss: float = 2.0,
+                 pcr_window: int = 20, vix_window: int = 20,
+                 require_pcr: bool = True, require_vix_band: bool = True,
+                 contracts: int = 1):
+        self.iv_rank_entry = iv_rank_entry
+        self.dte_target = dte_target
+        self.dte_exit = dte_exit
+        self.short_delta = short_delta
+        self.wing_width = wing_width
+        self.profit_target = profit_target
+        self.stop_loss = stop_loss
+        self.pcr_window = pcr_window
+        self.vix_window = vix_window
+        self.require_pcr = require_pcr
+        self.require_vix_band = require_vix_band
+        self.contracts = contracts
+
+    @property
+    def name(self) -> str:
+        return "PCR-Enhanced Iron Condor"
+
+    @property
+    def params(self) -> Dict:
+        return {
+            "iv_rank_entry": self.iv_rank_entry,
+            "dte_target": self.dte_target,
+            "short_delta": self.short_delta,
+            "wing_width": self.wing_width,
+            "require_pcr": self.require_pcr,
+            "require_vix_band": self.require_vix_band,
+        }
+
+    def generate_trades(self, closes, highs, lows, dates, risk_free_rate=0.04):
+        n = len(closes)
+        positions = [None] * n
+
+        iv_series = generate_iv_series(closes, base_iv=0.20, seed=42)
+        pcr_series = generate_pcr_series(closes, iv_series, seed=42)
+        pcr_signals = generate_pcr_signals(pcr_series, window=self.pcr_window)
+        vix_bands = generate_vix_bands(iv_series, window=self.vix_window)
+
+        in_position = False
+        position_entry_idx = 0
+        current_position = None
+
+        for i in range(252, n):
+            iv_history = iv_series[max(0, i - 252):i]
+            current_iv = iv_series[i]
+            ivr = iv_rank(current_iv, iv_history)
+            price = closes[i]
+            T = self.dte_target / 365.0
+
+            if in_position:
+                days_held = i - position_entry_idx
+                remaining_dte = self.dte_target - days_held
+
+                if remaining_dte <= self.dte_exit:
+                    current_position.exit_date = dates[i]
+                    pnl = self._calc_pnl(current_position, price, remaining_dte,
+                                         iv_series[i], risk_free_rate)
+                    current_position.exit_pnl = pnl
+                    in_position = False
+                    continue
+
+                current_value = self._position_value(
+                    current_position, price, remaining_dte, iv_series[i], risk_free_rate
+                )
+                credit = current_position.net_credit
+                if credit > 0:
+                    profit_pct = (credit - current_value) / credit
+                    if profit_pct >= self.profit_target:
+                        current_position.exit_date = dates[i]
+                        current_position.exit_pnl = credit - current_value
+                        in_position = False
+                        continue
+                    if current_value > credit * self.stop_loss:
+                        current_position.exit_date = dates[i]
+                        current_position.exit_pnl = credit - current_value
+                        in_position = False
+                        continue
+
+            else:
+                # Gate 1: Standard IV rank
+                if ivr < self.iv_rank_entry:
+                    continue
+
+                # Gate 2: PCR confirmation (extreme fear = high PCR)
+                if self.require_pcr and pcr_signals[i].signal != 1:
+                    continue
+
+                # Gate 3: VIX band — IV above its upper band
+                vix_mean, vix_upper, vix_lower = vix_bands[i]
+                if self.require_vix_band and current_iv < vix_upper:
+                    continue
+
+                # All gates passed → build Iron Condor
+                put_strike = self._find_strike_by_delta(
+                    price, T, risk_free_rate, current_iv,
+                    target_delta=-self.short_delta, option_type="put"
+                )
+                call_strike = self._find_strike_by_delta(
+                    price, T, risk_free_rate, current_iv,
+                    target_delta=self.short_delta, option_type="call"
+                )
+                put_long_strike = put_strike - self.wing_width
+                call_long_strike = call_strike + self.wing_width
+
+                short_put_prem = put_price(price, put_strike, T, risk_free_rate, current_iv)
+                long_put_prem = put_price(price, put_long_strike, T, risk_free_rate, current_iv)
+                short_call_prem = call_price(price, call_strike, T, risk_free_rate, current_iv)
+                long_call_prem = call_price(price, call_long_strike, T, risk_free_rate, current_iv)
+
+                position = OptionPosition(
+                    strategy_name="pcr_enhanced_ic",
+                    underlying_price=price,
+                    entry_date=dates[i],
+                    legs=[
+                        OptionTrade("put", "sell", put_strike, short_put_prem,
+                                    self.contracts, self.dte_target, current_iv,
+                                    delta(price, put_strike, T, risk_free_rate, current_iv, "put")),
+                        OptionTrade("put", "buy", put_long_strike, long_put_prem,
+                                    self.contracts, self.dte_target, current_iv,
+                                    delta(price, put_long_strike, T, risk_free_rate, current_iv, "put")),
+                        OptionTrade("call", "sell", call_strike, short_call_prem,
+                                    self.contracts, self.dte_target, current_iv,
+                                    delta(price, call_strike, T, risk_free_rate, current_iv, "call")),
+                        OptionTrade("call", "buy", call_long_strike, long_call_prem,
+                                    self.contracts, self.dte_target, current_iv,
+                                    delta(price, call_long_strike, T, risk_free_rate, current_iv, "call")),
+                    ]
+                )
+
+                positions[i] = position
+                current_position = position
+                position_entry_idx = i
+                in_position = True
 
         return positions

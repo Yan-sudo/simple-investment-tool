@@ -1,13 +1,19 @@
 """
-Option Backtesting Engine (v2 — Enhanced)
+Option Backtesting Engine (v3 — Enhanced)
 
-Upgrades over v1:
+Upgrades over v2:
 - Realistic slippage: 10% of bid-ask spread per leg (not flat %)
 - EV gating: only enter trades with positive expected value
 - Greeks monitoring: track portfolio Greeks and generate alerts
 - Wash sale detection: flag tax compliance issues
 - Dynamic hedging: track delta exposure and suggest hedges
 - Enhanced reporting with risk analysis sections
+
+v3 additions:
+- Long-only mode: filters out bearish positions
+- Holding period constraints: min 4 days, max 40 days
+- Trade journal / reflection: auto-learns from bad trades
+- Market sentiment: news-like event detection and filtering
 """
 
 import math
@@ -28,7 +34,9 @@ from options.pricing import call_price, put_price, all_greeks
 from options.risk_manager import GreeksSentinel, PortfolioRisk, format_risk_report
 from options.ev_model import EVAnalyzer, EVResult, format_ev_report
 from options.tax_compliance import WashSaleDetector, format_wash_sale_report
+from options.trade_journal import TradeJournal, ReflectionInsight, format_reflection_report
 from data.market_data import MarketData
+from data.sentiment import MarketSentimentAnalyzer, SentimentFilter, SentimentSignal
 
 
 @dataclass
@@ -107,6 +115,12 @@ class OptionBacktestResult:
     # v3 additions
     calmar_ratio: float = 0.0         # Annualized return / max drawdown
     max_consecutive_losses: int = 0   # Longest losing streak
+    # v3.1 additions — reflection + sentiment
+    reflection: Optional[ReflectionInsight] = None
+    sentiment_blocked: int = 0        # Trades blocked by sentiment filter
+    long_only_blocked: int = 0        # Bearish trades blocked by long-only filter
+    holding_period_exits: int = 0     # Trades force-exited by max holding days
+    sentiment_signals: Optional[list] = None  # Last N actionable signals
 
 
 class OptionBacktestEngine:
@@ -119,6 +133,12 @@ class OptionBacktestEngine:
     - Wash sale detection: track 30-day tax rule violations
     """
 
+    # Position direction classification for long-only filtering
+    _BULLISH = {"bull_put_spread", "long_call", "cash_secured_put", "covered_call"}
+    _BEARISH = {"bear_call_spread", "long_put"}
+    _NEUTRAL = {"iron_condor", "pcr_enhanced_ic", "long_straddle",
+                "long_strangle", "long_call_butterfly"}
+
     def __init__(self, initial_capital: float = 100_000.0,
                  commission_per_contract: float = 0.65,
                  slippage_pct_of_spread: float = 0.10,
@@ -127,7 +147,13 @@ class OptionBacktestEngine:
                  enable_greeks_monitor: bool = True,
                  enable_wash_sale: bool = True,
                  delta_threshold: float = 0.50,
-                 gamma_dollar_threshold: float = 500.0):
+                 gamma_dollar_threshold: float = 500.0,
+                 # v3.1 — long-only + holding constraints
+                 long_only: bool = False,
+                 min_holding_days: int = 4,
+                 max_holding_days: int = 40,
+                 enable_reflection: bool = True,
+                 enable_sentiment: bool = True):
         """
         Args:
             initial_capital: Starting cash
@@ -139,6 +165,11 @@ class OptionBacktestEngine:
             enable_wash_sale: If True, detect wash sale violations
             delta_threshold: Greeks sentinel delta alert threshold
             gamma_dollar_threshold: Greeks sentinel gamma dollar threshold
+            long_only: If True, block bearish positions (bear call spreads, long puts)
+            min_holding_days: Minimum holding period before exit allowed (4)
+            max_holding_days: Maximum holding period, force exit after this (40)
+            enable_reflection: If True, use trade journal to auto-adjust behaviour
+            enable_sentiment: If True, use sentiment analysis to gate entries
         """
         self.initial_capital = initial_capital
         self.commission_per_contract = commission_per_contract
@@ -147,6 +178,11 @@ class OptionBacktestEngine:
         self.enable_ev_filter = enable_ev_filter
         self.enable_greeks_monitor = enable_greeks_monitor
         self.enable_wash_sale = enable_wash_sale
+        self.long_only = long_only
+        self.min_holding_days = min_holding_days
+        self.max_holding_days = max_holding_days
+        self.enable_reflection = enable_reflection
+        self.enable_sentiment = enable_sentiment
 
         # Initialize sub-modules
         self.ev_analyzer = EVAnalyzer(
@@ -159,6 +195,13 @@ class OptionBacktestEngine:
             portfolio_capital=initial_capital,
         )
         self.wash_detector = WashSaleDetector(conservative=True)
+        self.journal = TradeJournal()
+        self.sentiment_analyzer = MarketSentimentAnalyzer()
+        self.sentiment_filter = SentimentFilter(block_on_extreme_fear=True)
+
+    def _is_bearish(self, pos: OptionPosition) -> bool:
+        """Check if position is a bearish directional trade."""
+        return pos.strategy_name in self._BEARISH
 
     def _calculate_slippage(self, legs, underlying_price: float,
                             iv: float, T: float, r: float) -> float:
@@ -246,7 +289,7 @@ class OptionBacktestEngine:
         return None
 
     def run(self, strategy: OptionStrategy, data: MarketData) -> OptionBacktestResult:
-        """Run a full option strategy backtest with all v2 enhancements."""
+        """Run a full option strategy backtest with all v3 enhancements."""
         closes = data.close
         highs = data.high
         lows = data.low
@@ -260,6 +303,13 @@ class OptionBacktestEngine:
         iv_series = generate_iv_series(closes, base_iv=0.20, seed=42)
         hv_series = historical_volatility(closes, window=20)
 
+        # Pre-compute sentiment signals
+        sentiment_signals = []
+        if self.enable_sentiment:
+            sentiment_signals = self.sentiment_analyzer.analyze(
+                closes, highs, lows, iv_series=iv_series, dates=dates
+            )
+
         # Track portfolio
         cash = self.initial_capital
         portfolio_values = [self.initial_capital] * n
@@ -271,9 +321,14 @@ class OptionBacktestEngine:
         total_slippage = 0.0
         ev_filtered_count = 0
         total_greeks_alerts = 0
+        sentiment_blocked_count = 0
+        long_only_blocked_count = 0
+        holding_period_exit_count = 0
 
-        # Reset wash sale detector
+        # Reset sub-modules
         self.wash_detector = WashSaleDetector(conservative=True)
+        self.journal = TradeJournal()
+        pause_until_idx = -1  # Reflection-driven pause
 
         active_positions: List[Tuple[int, OptionPosition, float, float, EVResult]] = []
         # (entry_idx, position, commission_paid, slippage_paid, ev_result)
@@ -285,6 +340,33 @@ class OptionBacktestEngine:
             # ── Check for new positions ──
             if positions[i] is not None:
                 pos = positions[i]
+
+                # v3.1 — Long-only filter: block bearish positions
+                if self.long_only and self._is_bearish(pos):
+                    long_only_blocked_count += 1
+                    positions[i] = None
+                    portfolio_values[i] = cash
+                    cash_history[i] = cash
+                    continue
+
+                # v3.1 — Reflection pause: skip if journal says pause
+                if self.enable_reflection and i < pause_until_idx:
+                    positions[i] = None
+                    portfolio_values[i] = cash
+                    cash_history[i] = cash
+                    continue
+
+                # v3.1 — Sentiment filter: block on extreme bearish events
+                if self.enable_sentiment and i < len(sentiment_signals):
+                    signal = sentiment_signals[i]
+                    direction = "long" if not self._is_bearish(pos) else "short"
+                    if not self.sentiment_filter.should_trade(signal, direction):
+                        sentiment_blocked_count += 1
+                        positions[i] = None
+                        portfolio_values[i] = cash
+                        cash_history[i] = cash
+                        continue
+
                 max_risk = pos.max_loss if pos.max_loss < float('inf') else \
                     self.initial_capital * self.max_position_pct
 
@@ -343,6 +425,29 @@ class OptionBacktestEngine:
             # ── Check for exiting positions ──
             closed = []
             for idx, (entry_idx, pos, entry_comm, entry_slip, ev_result) in enumerate(active_positions):
+                holding_days_now = i - entry_idx
+
+                # v3.1 — Enforce min holding: delay exit if too early
+                if pos.exit_date == dates[i] and holding_days_now < self.min_holding_days:
+                    pos.exit_date = None  # Cancel premature exit, let it continue
+
+                # v3.1 — Enforce max holding: force exit if held too long
+                if pos.exit_date is None and holding_days_now >= self.max_holding_days:
+                    # Force close at current market value
+                    T_left = max(1 / 365.0, (pos.legs[0].dte - holding_days_now) / 365.0)
+                    from options.strategies import _StrategyMixin
+                    if pos.net_credit > 0:
+                        forced_pnl = _StrategyMixin._calc_pnl(
+                            pos, closes[i], max(1, pos.legs[0].dte - holding_days_now),
+                            current_iv, 0.04)
+                    else:
+                        forced_pnl = _StrategyMixin._long_position_value(
+                            pos, closes[i], max(1, pos.legs[0].dte - holding_days_now),
+                            current_iv, 0.04) - abs(pos.net_credit)
+                    pos.exit_date = dates[i]
+                    pos.exit_pnl = forced_pnl
+                    holding_period_exit_count += 1
+
                 if pos.exit_date == dates[i]:
                     pnl = pos.exit_pnl
 
@@ -389,6 +494,8 @@ class OptionBacktestEngine:
                     remaining_dte = pos.legs[0].dte - holding_days if pos.legs else 0
                     if remaining_dte <= 0:
                         exit_reason = "EXPIRATION"
+                    if holding_days >= self.max_holding_days:
+                        exit_reason = "MAX_HOLD"
 
                     total_costs = entry_comm + entry_slip + close_commission + close_slippage
 
@@ -416,6 +523,14 @@ class OptionBacktestEngine:
                     )
                     trades.append(trade_record)
                     closed.append(idx)
+
+                    # Record for reflection journal
+                    if self.enable_reflection:
+                        self.journal.record_trade(trade_record)
+                        insight = self.journal.reflect()
+                        if insight.should_pause:
+                            self.journal.activate_pause()
+                            pause_until_idx = i + insight.cooldown_adjustment
 
                     # Record for wash sale tracking
                     if self.enable_wash_sale:
@@ -453,6 +568,13 @@ class OptionBacktestEngine:
         # Wash sale summary
         ws_summary = self.wash_detector.get_summary()
 
+        # Final reflection insight
+        final_reflection = self.journal.reflect() if self.enable_reflection else None
+
+        # Collect actionable sentiment signals (last 20)
+        actionable_signals = [s for s in sentiment_signals if s.actionable][-20:] \
+            if sentiment_signals else None
+
         return OptionBacktestResult(
             strategy_name=strategy.name,
             params=strategy.params,
@@ -477,6 +599,11 @@ class OptionBacktestEngine:
             wash_sale_violations=ws_summary['wash_sale_violations'],
             wash_sale_disallowed=ws_summary['total_disallowed_losses'],
             risk_snapshot=risk_snapshot,
+            reflection=final_reflection,
+            sentiment_blocked=sentiment_blocked_count,
+            long_only_blocked=long_only_blocked_count,
+            holding_period_exits=holding_period_exit_count,
+            sentiment_signals=actionable_signals,
             **metrics,
         )
 
@@ -698,6 +825,45 @@ def generate_option_report(result: OptionBacktestResult) -> str:
     lines.append(f"  Wash Sale Violations:  {result.wash_sale_violations}")
     lines.append(f"  Disallowed Losses:     ${result.wash_sale_disallowed:>10,.2f}")
     lines.append("")
+
+    # v3.1 — Filtering summary
+    if result.long_only_blocked or result.sentiment_blocked or result.holding_period_exits:
+        lines.append("─" * 70)
+        lines.append("  TRADE FILTERS (v3)")
+        lines.append("─" * 70)
+        lines.append(f"  Long-Only Blocked:     {result.long_only_blocked:>10d}")
+        lines.append(f"  Sentiment Blocked:     {result.sentiment_blocked:>10d}")
+        lines.append(f"  Max-Hold Forced Exit:  {result.holding_period_exits:>10d}")
+        lines.append("")
+
+    # v3.1 — Reflection insights
+    if result.reflection:
+        lines.append("─" * 70)
+        lines.append("  TRADE REFLECTION / SELF-CORRECTION")
+        lines.append("─" * 70)
+        r = result.reflection
+        lines.append(f"  Confidence Score:   {r.confidence_score:.2f}")
+        lines.append(f"  Position Size Mult: {r.position_size_mult:.2f}x")
+        lines.append(f"  Entry Tightening:   +{r.entry_tightening:.1f} IVR")
+        lines.append(f"  Cooldown Adj:       +{r.cooldown_adjustment}d")
+        if r.lesson_tags:
+            lines.append(f"  Lessons Learned:    {', '.join(r.lesson_tags)}")
+        if r.reasoning:
+            lines.append(f"  Reasoning:")
+            for reason in r.reasoning[:5]:
+                lines.append(f"    - {reason}")
+        lines.append("")
+
+    # v3.1 — Sentiment summary
+    if result.sentiment_signals:
+        lines.append("─" * 70)
+        lines.append("  MARKET SENTIMENT EVENTS")
+        lines.append("─" * 70)
+        for sig in result.sentiment_signals[-10:]:
+            arrow = "+" if sig.score > 0 else "-" if sig.score < 0 else "="
+            lines.append(f"  {sig.date[:10]:>10}  {arrow}{abs(sig.score):.1f}  "
+                         f"{sig.event_type:<16} {sig.description[:40]}")
+        lines.append("")
 
     # Strategy rating
     lines.append("─" * 70)

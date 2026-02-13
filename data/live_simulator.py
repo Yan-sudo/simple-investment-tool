@@ -124,10 +124,12 @@ class LiveSimulator:
         symbol: str = "SPY",
         initial_capital: float = 100_000.0,
         strategy_name: str = "iron_condor",
+        **engine_kwargs,
     ) -> None:
         self.symbol = symbol
         self.initial_capital = initial_capital
         self.strategy_name = strategy_name
+        self._engine_kwargs = engine_kwargs  # Passed through to OptionBacktestEngine
 
         # Try to create an Alpaca client (may be unavailable)
         self._alpaca: Optional[object] = None
@@ -150,7 +152,7 @@ class LiveSimulator:
 
     # ── Data fetching ─────────────────────────────────────────────────────
 
-    def fetch_current_data(self, days: int = 500) -> MarketData:
+    def fetch_current_data(self, days: int = 500, seed: int = 42) -> MarketData:
         """Return the most recent *days* of market data.
 
         Behaviour:
@@ -174,21 +176,30 @@ class LiveSimulator:
                 pass  # Fall through to synthetic
 
         # Synthetic fallback: anchor end-date to today
-        return self._generate_recent_synthetic(days)
+        return self._generate_recent_synthetic(days, seed=seed)
 
     # ── Backtesting ───────────────────────────────────────────────────────
 
-    def run_live_backtest(self, data: MarketData) -> OptionBacktestResult:
-        """Run the configured option strategy on the supplied data.
+    def run_live_backtest(self, strategy_or_data=None, data=None) -> OptionBacktestResult:
+        """Run an option strategy on the supplied data.
 
-        Args:
-            data: MarketData to backtest against.
+        Accepts either:
+            run_live_backtest(data)          — uses self.strategy_name
+            run_live_backtest(strategy, data) — uses the given strategy object
 
         Returns:
             OptionBacktestResult with full performance metrics.
         """
-        strategy = _resolve_strategy(self.strategy_name)
-        engine = OptionBacktestEngine(initial_capital=self.initial_capital)
+        if data is None:
+            # Called as run_live_backtest(data) — single arg
+            data = strategy_or_data
+            strategy = _resolve_strategy(self.strategy_name)
+        else:
+            # Called as run_live_backtest(strategy, data)
+            strategy = strategy_or_data
+        engine = OptionBacktestEngine(
+            initial_capital=self.initial_capital, **self._engine_kwargs
+        )
         return engine.run(strategy, data)
 
     # ── Current snapshot ──────────────────────────────────────────────────
@@ -321,6 +332,34 @@ class LiveSimulator:
 
             if delay > 0:
                 time.sleep(delay)
+
+    # ── Snapshot helpers ────────────────────────────────────────────────
+
+    def get_snapshots(self, data: MarketData) -> List[MarketSnapshot]:
+        """Build daily MarketSnapshot series from MarketData.
+
+        Useful for plotting price + IV overlay in the GUI.
+        """
+        iv_series = generate_iv_series(data.close, base_iv=0.20, seed=42)
+        hv = historical_volatility(data.close, window=20)
+        snapshots: List[MarketSnapshot] = []
+        for i in range(len(data)):
+            prev_close = data.close[i - 1] if i > 0 else data.close[i]
+            change = ((data.close[i] - prev_close) / prev_close * 100) if prev_close > 0 else 0
+            iv = iv_series[i] if i < len(iv_series) else 0.20
+            # IVR over last 60 days
+            iv_window = iv_series[max(0, i - 60):i]
+            ivr = iv_rank(iv, iv_window) if iv_window else 50.0
+            snapshots.append(MarketSnapshot(
+                symbol=self.symbol,
+                price=data.close[i],
+                change_pct=change,
+                volume=int(data.volume[i]) if hasattr(data, 'volume') and data.volume else 0,
+                timestamp=str(data.dates[i]),
+                iv_estimate=iv,
+                ivr_estimate=ivr,
+            ))
+        return snapshots
 
     # ── Internal helpers ──────────────────────────────────────────────────
 

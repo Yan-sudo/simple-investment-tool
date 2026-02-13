@@ -158,6 +158,15 @@ def render_sidebar():
         "Commission Rate / 手续费", 0.0, 0.01, 0.001, step=0.0001, format="%.4f"
     )
 
+    # v3.1 — Trading constraints
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Trading Constraints / 交易约束")
+    long_only = st.sidebar.checkbox("Long Only / 只做多", value=True)
+    min_hold = st.sidebar.slider("Min Holding Days / 最短持仓", 1, 20, 4)
+    max_hold = st.sidebar.slider("Max Holding Days / 最长持仓", 10, 90, 40)
+    enable_reflection = st.sidebar.checkbox("Trade Reflection / 交易反思", value=True)
+    enable_sentiment = st.sidebar.checkbox("Sentiment Filter / 情绪过滤", value=True)
+
     return {
         "mode": mode,
         "data_source": data_source,
@@ -166,6 +175,11 @@ def render_sidebar():
         "seed": seed,
         "capital": capital,
         "commission": commission,
+        "long_only": long_only,
+        "min_hold": min_hold,
+        "max_hold": max_hold,
+        "enable_reflection": enable_reflection,
+        "enable_sentiment": enable_sentiment,
     }
 
 
@@ -616,6 +630,11 @@ def page_options(cfg):
     engine = OptionBacktestEngine(
         initial_capital=cfg["capital"],
         commission_per_contract=0.65,
+        long_only=cfg.get("long_only", False),
+        min_holding_days=cfg.get("min_hold", 4),
+        max_holding_days=cfg.get("max_hold", 40),
+        enable_reflection=cfg.get("enable_reflection", True),
+        enable_sentiment=cfg.get("enable_sentiment", True),
     )
 
     if st.button("🚀 Run Option Backtest / 运行期权回测", type="primary",
@@ -650,9 +669,10 @@ def _run_single_option(engine, data, info, name):
     st.plotly_chart(build_option_equity_chart(result), use_container_width=True)
 
     # Trade log
-    tab_log, tab_cost, tab_ev = st.tabs(
-        ["Trade Log / 交易记录", "Costs / 成本分析", "EV Analysis / 期望值"]
-    )
+    tab_log, tab_cost, tab_ev, tab_reflect, tab_sentiment = st.tabs([
+        "Trade Log / 交易记录", "Costs / 成本分析", "EV Analysis / 期望值",
+        "Reflection / 反思", "Sentiment / 情绪",
+    ])
 
     with tab_log:
         if result.trades:
@@ -689,6 +709,59 @@ def _run_single_option(engine, data, info, name):
         st.metric("Avg POP at Entry", f"{result.avg_pop_at_entry:.1%}")
         st.metric("EV-Filtered (rejected)", f"{result.ev_filtered_trades}")
 
+    with tab_reflect:
+        # Trade filter summary
+        f1, f2, f3 = st.columns(3)
+        f1.metric("Long-Only Blocked", result.long_only_blocked)
+        f2.metric("Sentiment Blocked", result.sentiment_blocked)
+        f3.metric("Max-Hold Exits", result.holding_period_exits)
+
+        if result.reflection:
+            st.markdown("---")
+            st.markdown("### Self-Correction Insights / 自我修正")
+            r = result.reflection
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Confidence", f"{r.confidence_score:.2f}")
+            r2.metric("Position Size", f"{r.position_size_mult:.2f}x")
+            r3.metric("Entry Adj", f"+{r.entry_tightening:.0f} IVR")
+            r4.metric("Cooldown Adj", f"+{r.cooldown_adjustment}d")
+
+            if r.lesson_tags:
+                st.markdown("**Lessons Learned / 经验教训:**")
+                tag_labels = {
+                    "hold_too_long": "Holding losers too long",
+                    "iv_mean_reversion_risk": "IV overestimate at entry",
+                    "cut_losers_faster": "Should cut losses earlier",
+                    "directional_risk": "Directional exposure too high",
+                }
+                for tag in r.lesson_tags:
+                    label = tag_labels.get(tag, tag)
+                    st.warning(f"{label}")
+
+            if r.reasoning:
+                with st.expander("Detailed Reasoning / 详细分析"):
+                    for reason in r.reasoning:
+                        st.write(f"- {reason}")
+        else:
+            st.info("Reflection disabled or no trades completed.")
+
+    with tab_sentiment:
+        if result.sentiment_signals:
+            st.markdown("### Market Events Detected / 检测到的市场事件")
+            sig_rows = []
+            for sig in result.sentiment_signals:
+                sig_rows.append({
+                    "Date": sig.date[:10] if sig.date else "",
+                    "Score": f"{sig.score:+.2f}",
+                    "Magnitude": f"{sig.magnitude:.2f}",
+                    "Event": sig.event_type,
+                    "Description": sig.description,
+                })
+            st.dataframe(pd.DataFrame(sig_rows), use_container_width=True,
+                          hide_index=True)
+        else:
+            st.info("Sentiment analysis disabled or no actionable events.")
+
 
 def _run_option_compare(engine, data, strats):
     """Compare all option strategies."""
@@ -718,6 +791,8 @@ def _run_option_compare(engine, data, strats):
             "Trades": r.positions_closed,
             "Profit Factor": f"{r.profit_factor:.2f}",
             "Avg EV": f"${r.avg_ev_at_entry:+,.0f}",
+            "LO Block": r.long_only_blocked,
+            "Sent Block": r.sentiment_blocked,
             "Costs": f"${r.total_transaction_costs:,.0f}",
         })
 
@@ -1019,6 +1094,11 @@ def page_live_sim(cfg):
             sim = LiveSimulator(
                 symbol=cfg["symbol"],
                 initial_capital=cfg["capital"],
+                long_only=cfg.get("long_only", False),
+                min_holding_days=cfg.get("min_hold", 4),
+                max_holding_days=cfg.get("max_hold", 40),
+                enable_reflection=cfg.get("enable_reflection", True),
+                enable_sentiment=cfg.get("enable_sentiment", True),
             )
 
             data = sim.fetch_current_data(days=sim_days, seed=cfg["seed"])

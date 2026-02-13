@@ -370,6 +370,27 @@ def main():
         "--days", type=int, default=750,
         help="模拟天数 (default: 750)",
     )
+    # v3.1 — Trading constraints
+    parser.add_argument(
+        "--long-only", action="store_true",
+        help="只做多 / Long-only mode (block bearish trades)",
+    )
+    parser.add_argument(
+        "--min-hold", type=int, default=4,
+        help="最短持仓天数 / Min holding days (default: 4)",
+    )
+    parser.add_argument(
+        "--max-hold", type=int, default=40,
+        help="最长持仓天数 / Max holding days (default: 40)",
+    )
+    parser.add_argument(
+        "--no-reflection", action="store_true",
+        help="禁用反思 / Disable trade reflection",
+    )
+    parser.add_argument(
+        "--no-sentiment", action="store_true",
+        help="禁用情绪 / Disable sentiment filter",
+    )
 
     args = parser.parse_args()
 
@@ -400,6 +421,11 @@ def main():
         engine = OptionBacktestEngine(
             initial_capital=args.capital,
             commission_per_contract=0.65,
+            long_only=args.long_only,
+            min_holding_days=args.min_hold,
+            max_holding_days=args.max_hold,
+            enable_reflection=not args.no_reflection,
+            enable_sentiment=not args.no_sentiment,
         )
 
         _load_option_strategies()

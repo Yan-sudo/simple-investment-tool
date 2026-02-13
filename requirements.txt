@@ -7,3 +7,11 @@
 
 # The tool runs fully with Python 3.8+ standard library.
 # No external packages required.
+
+# ── GUI Dashboard Dependencies ───────────────────────────────────────────
+# Install these to use the Streamlit visual dashboard (gui/app.py):
+#   pip install -r requirements-gui.txt
+# Or install individually:
+streamlit>=1.28.0
+plotly>=5.18.0
+pandas>=2.0.0

@@ -80,7 +80,8 @@ class EVAnalyzer:
                  slippage_pct: float = 0.10,
                  min_ev_threshold: float = 0.0,
                  min_pop: float = 0.0,
-                 risk_free_rate: float = 0.04):
+                 risk_free_rate: float = 0.04,
+                 variance_risk_premium: float = 0.15):
         """
         Args:
             commission_per_contract: Per contract per leg ($)
@@ -88,12 +89,16 @@ class EVAnalyzer:
             min_ev_threshold: Minimum EV to accept trade ($)
             min_pop: Minimum probability of profit (0-1)
             risk_free_rate: Risk-free rate
+            variance_risk_premium: IV/HV ratio premium (empirically ~1.15-1.20).
+                For credit strategies, POP is recalculated using realized vol
+                (= IV / (1 + vrp)) to capture the structural seller edge.
         """
         self.commission_per_contract = commission_per_contract
         self.slippage_pct = slippage_pct
         self.min_ev_threshold = min_ev_threshold
         self.min_pop = min_pop
         self.risk_free_rate = risk_free_rate
+        self.variance_risk_premium = variance_risk_premium
 
     def probability_of_profit_credit_spread(
         self, S: float, K_short: float, K_long: float,
@@ -133,11 +138,13 @@ class EVAnalyzer:
     ) -> float:
         """POP for an iron condor.
 
-        Pseudocode:
-            lower_breakeven = K_put_short - net_credit_per_share
-            upper_breakeven = K_call_short + net_credit_per_share
-            POP = P(lower_BE < S < upper_BE at expiry)
-                = N(d2_upper) - N(d2_lower)
+        POP = P(lower_BE < S_T < upper_BE)
+            = N(d2 w.r.t. lower_BE) - N(d2 w.r.t. upper_BE)
+
+        where d2 = [ln(S/K) + (r - sigma^2/2)*T] / (sigma*sqrt(T))
+        For K=lower_BE (< S): d2 > 0 → N(d2) is large
+        For K=upper_BE (> S): d2 < 0 → N(d2) is small
+        So POP = N(d2_lower) - N(d2_upper) > 0
         """
         r = self.risk_free_rate
         credit_per_share = net_credit / 100.0
@@ -145,10 +152,12 @@ class EVAnalyzer:
         lower_be = K_put_short - credit_per_share
         upper_be = K_call_short + credit_per_share
 
-        _, d2_upper = _d1_d2(S, upper_be, T, r, sigma)
         _, d2_lower = _d1_d2(S, lower_be, T, r, sigma)
+        _, d2_upper = _d1_d2(S, upper_be, T, r, sigma)
 
-        pop = _norm_cdf(d2_upper) - _norm_cdf(d2_lower)
+        # N(d2_lower) = P(S_T > lower_BE), N(d2_upper) = P(S_T > upper_BE)
+        # POP = P(S_T > lower_BE) - P(S_T > upper_BE)
+        pop = _norm_cdf(d2_lower) - _norm_cdf(d2_upper)
         return max(0.0, min(1.0, pop))
 
     def probability_of_profit_straddle(
@@ -218,10 +227,16 @@ class EVAnalyzer:
         total_commission = self.commission_per_contract * contracts * num_legs * 2  # open + close
         slippage = net_credit * self.slippage_pct
 
-        # POP
+        # POP — use realized vol (IV / VRP) for credit strategies.
+        # The variance risk premium means options are systematically overpriced
+        # relative to realized moves. POP calculated at realized vol is more
+        # accurate for credit sellers.
+        realized_vol = iv / (1 + self.variance_risk_premium) if iv > 0 else hv
+        realized_vol = max(realized_vol, hv * 0.8)  # floor at 80% of HV
+
         pop = self.probability_of_profit_iron_condor(
             S, K_put_short, K_put_long, K_call_short, K_call_long,
-            T, iv, net_credit
+            T, realized_vol, net_credit
         )
 
         # EV
@@ -294,11 +309,17 @@ class EVAnalyzer:
         total_commission = self.commission_per_contract * contracts * 2 * 2
         slippage = net_credit * self.slippage_pct
 
+        # Use realized vol for credit spread POP (VRP adjustment)
+        realized_vol = iv / (1 + self.variance_risk_premium) if iv > 0 else hv
+        realized_vol = max(realized_vol, hv * 0.8)
+
         pop = self.probability_of_profit_credit_spread(
-            S, K_short, K_long, T, iv, net_credit, spread_type
+            S, K_short, K_long, T, realized_vol, net_credit, spread_type
         )
 
-        ev_raw = pop * max_profit - (1 - pop) * max_loss
+        # Expected loss uses 65% of max_loss (managed exits limit losses in practice)
+        expected_loss = max_loss * 0.65
+        ev_raw = pop * max_profit - (1 - pop) * expected_loss
         ev_adjusted = ev_raw - total_commission - slippage
 
         edge_pct = (ev_adjusted / max_loss * 100) if max_loss > 0 else 0

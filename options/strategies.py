@@ -6,11 +6,23 @@ Implements the most effective real-world option strategies:
 2. Iron Condor (range-bound income)
 3. Vertical Spreads (directional credit/debit)
 4. Straddle/Strangle (volatility plays)
+5. Butterfly Spread (pinning plays)
+6. PCR-Enhanced Iron Condor (sentiment-filtered)
+7. IV-Adaptive (meta-strategy)
+8. TA-Driven (technical-analysis entries)
 
 Each strategy generates structured trade signals based on:
 - IV analysis (sell premium when IV is high, buy when low)
 - Technical signals from the underlying
 - Greeks-based position management
+
+Architecture notes:
+- Every strategy accepts `ivr_lookback` (default 60) and `max_concurrent`
+  (default 3) parameters.
+- Concurrent positions are tracked via an `open_positions` list instead of
+  a single `in_position` flag.
+- A cooldown of 5 trading days is enforced between opening successive
+  positions.
 """
 
 import math
@@ -252,10 +264,11 @@ class IronCondorStrategy(_StrategyMixin, OptionStrategy):
     Exit: DTE < exit_dte, or profit target hit, or max loss hit
     """
 
-    def __init__(self, iv_rank_entry: float = 50.0, dte_target: int = 45,
+    def __init__(self, iv_rank_entry: float = 40.0, dte_target: int = 45,
                  dte_exit: int = 21, short_delta: float = 0.16,
                  wing_width: float = 5.0, profit_target: float = 0.50,
-                 stop_loss: float = 2.0, contracts: int = 1):
+                 stop_loss: float = 2.0, contracts: int = 1,
+                 ivr_lookback: int = 60, max_concurrent: int = 3):
         self.iv_rank_entry = iv_rank_entry
         self.dte_target = dte_target
         self.dte_exit = dte_exit
@@ -264,6 +277,8 @@ class IronCondorStrategy(_StrategyMixin, OptionStrategy):
         self.profit_target = profit_target  # Close at 50% of max profit
         self.stop_loss = stop_loss      # Close at 2x credit received loss
         self.contracts = contracts
+        self.ivr_lookback = ivr_lookback
+        self.max_concurrent = max_concurrent
 
     @property
     def name(self) -> str:
@@ -277,6 +292,8 @@ class IronCondorStrategy(_StrategyMixin, OptionStrategy):
             "short_delta": self.short_delta,
             "wing_width": self.wing_width,
             "profit_target": self.profit_target,
+            "ivr_lookback": self.ivr_lookback,
+            "max_concurrent": self.max_concurrent,
         }
 
     def generate_trades(self, closes, highs, lows, dates, risk_free_rate=0.04):
@@ -286,52 +303,53 @@ class IronCondorStrategy(_StrategyMixin, OptionStrategy):
         hv = historical_volatility(closes, window=20)
         iv_series = generate_iv_series(closes, base_iv=0.20, seed=42)
 
-        in_position = False
-        position_entry_idx = 0
-        current_position = None
+        open_positions = []  # list of (entry_idx, position)
+        last_open_idx = -999  # cooldown tracking
 
-        for i in range(252, n):  # Need 1 year of data for IV rank
-            iv_history = iv_series[max(0, i - 252):i]
+        for i in range(self.ivr_lookback, n):
+            iv_history = iv_series[max(0, i - self.ivr_lookback):i]
             current_iv = iv_series[i]
             ivr = iv_rank(current_iv, iv_history)
             price = closes[i]
             T = self.dte_target / 365.0
 
-            if in_position:
-                # Check exit conditions
-                days_held = i - position_entry_idx
+            # --- Check exits for all open positions ---
+            still_open = []
+            for entry_idx, pos in open_positions:
+                days_held = i - entry_idx
                 remaining_dte = self.dte_target - days_held
 
+                exited = False
                 if remaining_dte <= self.dte_exit:
-                    # Exit at DTE target
-                    current_position.exit_date = dates[i]
-                    pnl = self._calc_pnl(current_position, price, remaining_dte,
+                    pos.exit_date = dates[i]
+                    pnl = self._calc_pnl(pos, price, remaining_dte,
                                          iv_series[i], risk_free_rate)
-                    current_position.exit_pnl = pnl
-                    in_position = False
-                    continue
+                    pos.exit_pnl = pnl
+                    exited = True
+                else:
+                    current_value = self._position_value(pos, price,
+                                                         remaining_dte, iv_series[i],
+                                                         risk_free_rate)
+                    credit = pos.net_credit
+                    if credit > 0:
+                        profit_pct = (credit - current_value) / credit
+                        if profit_pct >= self.profit_target:
+                            pos.exit_date = dates[i]
+                            pos.exit_pnl = credit - current_value
+                            exited = True
+                        elif current_value > credit * self.stop_loss:
+                            pos.exit_date = dates[i]
+                            pos.exit_pnl = credit - current_value
+                            exited = True
 
-                # Check profit target / stop loss
-                current_value = self._position_value(current_position, price,
-                                                     remaining_dte, iv_series[i],
-                                                     risk_free_rate)
-                credit = current_position.net_credit
-                if credit > 0:
-                    profit_pct = (credit - current_value) / credit
-                    if profit_pct >= self.profit_target:
-                        current_position.exit_date = dates[i]
-                        current_position.exit_pnl = credit - current_value
-                        in_position = False
-                        continue
-                    if current_value > credit * self.stop_loss:
-                        current_position.exit_date = dates[i]
-                        current_position.exit_pnl = credit - current_value
-                        in_position = False
-                        continue
-            else:
-                # Check entry conditions
+                if not exited:
+                    still_open.append((entry_idx, pos))
+
+            open_positions = still_open
+
+            # --- Check entry if capacity available and cooldown elapsed ---
+            if len(open_positions) < self.max_concurrent and (i - last_open_idx) >= 5:
                 if ivr >= self.iv_rank_entry:
-                    # Find short strikes at target delta
                     put_strike = self._find_strike_by_delta(
                         price, T, risk_free_rate, current_iv,
                         target_delta=-self.short_delta, option_type="put"
@@ -344,7 +362,6 @@ class IronCondorStrategy(_StrategyMixin, OptionStrategy):
                     put_long_strike = put_strike - self.wing_width
                     call_long_strike = call_strike + self.wing_width
 
-                    # Calculate premiums
                     short_put_prem = put_price(price, put_strike, T, risk_free_rate, current_iv)
                     long_put_prem = put_price(price, put_long_strike, T, risk_free_rate, current_iv)
                     short_call_prem = call_price(price, call_strike, T, risk_free_rate, current_iv)
@@ -371,9 +388,8 @@ class IronCondorStrategy(_StrategyMixin, OptionStrategy):
                     )
 
                     positions[i] = position
-                    current_position = position
-                    position_entry_idx = i
-                    in_position = True
+                    open_positions.append((i, position))
+                    last_open_idx = i
 
         return positions
 
@@ -389,10 +405,11 @@ class VerticalSpreadStrategy(_StrategyMixin, OptionStrategy):
     """
 
     def __init__(self, ma_fast: int = 20, ma_slow: int = 50,
-                 iv_rank_entry: float = 40.0, dte_target: int = 30,
+                 iv_rank_entry: float = 30.0, dte_target: int = 30,
                  dte_exit: int = 10, spread_width: float = 5.0,
                  short_delta: float = 0.30, profit_target: float = 0.65,
-                 contracts: int = 1):
+                 contracts: int = 1,
+                 ivr_lookback: int = 60, max_concurrent: int = 3):
         self.ma_fast = ma_fast
         self.ma_slow = ma_slow
         self.iv_rank_entry = iv_rank_entry
@@ -402,6 +419,8 @@ class VerticalSpreadStrategy(_StrategyMixin, OptionStrategy):
         self.short_delta = short_delta
         self.profit_target = profit_target
         self.contracts = contracts
+        self.ivr_lookback = ivr_lookback
+        self.max_concurrent = max_concurrent
 
     @property
     def name(self) -> str:
@@ -415,6 +434,8 @@ class VerticalSpreadStrategy(_StrategyMixin, OptionStrategy):
             "iv_rank_entry": self.iv_rank_entry,
             "spread_width": self.spread_width,
             "short_delta": self.short_delta,
+            "ivr_lookback": self.ivr_lookback,
+            "max_concurrent": self.max_concurrent,
         }
 
     def _sma(self, values, window):
@@ -432,42 +453,48 @@ class VerticalSpreadStrategy(_StrategyMixin, OptionStrategy):
         fast_ma = self._sma(closes, self.ma_fast)
         slow_ma = self._sma(closes, self.ma_slow)
 
-        in_position = False
-        position_entry_idx = 0
-        current_position = None
+        open_positions = []
+        last_open_idx = -999
 
-        for i in range(252, n):
-            iv_history = iv_series[max(0, i - 252):i]
+        for i in range(self.ivr_lookback, n):
+            iv_history = iv_series[max(0, i - self.ivr_lookback):i]
             current_iv = iv_series[i]
             ivr = iv_rank(current_iv, iv_history)
             price = closes[i]
             T = self.dte_target / 365.0
 
-            if in_position:
-                days_held = i - position_entry_idx
+            # --- Check exits for all open positions ---
+            still_open = []
+            for entry_idx, pos in open_positions:
+                days_held = i - entry_idx
                 remaining_dte = self.dte_target - days_held
 
+                exited = False
                 if remaining_dte <= self.dte_exit:
-                    current_position.exit_date = dates[i]
-                    pnl = self._calc_pnl(current_position, price, remaining_dte,
+                    pos.exit_date = dates[i]
+                    pnl = self._calc_pnl(pos, price, remaining_dte,
                                          iv_series[i], risk_free_rate)
-                    current_position.exit_pnl = pnl
-                    in_position = False
-                    continue
+                    pos.exit_pnl = pnl
+                    exited = True
+                else:
+                    current_value = self._position_value(pos, price,
+                                                         remaining_dte, iv_series[i],
+                                                         risk_free_rate)
+                    credit = pos.net_credit
+                    if credit > 0:
+                        profit_pct = (credit - current_value) / credit
+                        if profit_pct >= self.profit_target:
+                            pos.exit_date = dates[i]
+                            pos.exit_pnl = credit - current_value
+                            exited = True
 
-                # Profit target check
-                current_value = self._position_value(current_position, price,
-                                                     remaining_dte, iv_series[i],
-                                                     risk_free_rate)
-                credit = current_position.net_credit
-                if credit > 0:
-                    profit_pct = (credit - current_value) / credit
-                    if profit_pct >= self.profit_target:
-                        current_position.exit_date = dates[i]
-                        current_position.exit_pnl = credit - current_value
-                        in_position = False
-                        continue
-            else:
+                if not exited:
+                    still_open.append((entry_idx, pos))
+
+            open_positions = still_open
+
+            # --- Check entry ---
+            if len(open_positions) < self.max_concurrent and (i - last_open_idx) >= 5:
                 if ivr >= self.iv_rank_entry and fast_ma[i] > 0 and slow_ma[i] > 0:
                     is_uptrend = fast_ma[i] > slow_ma[i]
 
@@ -521,9 +548,8 @@ class VerticalSpreadStrategy(_StrategyMixin, OptionStrategy):
                         )
 
                     positions[i] = position
-                    current_position = position
-                    position_entry_idx = i
-                    in_position = True
+                    open_positions.append((i, position))
+                    last_open_idx = i
 
         return positions
 
@@ -539,16 +565,23 @@ class WheelStrategy(_StrategyMixin, OptionStrategy):
     Phase 3: If called away, go back to Phase 1
 
     Entry: IV Rank > threshold, underlying near support
+
+    Note: The Wheel is inherently single-position (one stock lot at a time)
+    so max_concurrent does not apply in the same way. However ivr_lookback
+    is honoured for IV rank calculation.
     """
 
     def __init__(self, iv_rank_entry: float = 30.0, dte_target: int = 30,
                  put_delta: float = 0.30, call_delta: float = 0.30,
-                 contracts: int = 1):
+                 contracts: int = 1,
+                 ivr_lookback: int = 60, max_concurrent: int = 3):
         self.iv_rank_entry = iv_rank_entry
         self.dte_target = dte_target
         self.put_delta = put_delta
         self.call_delta = call_delta
         self.contracts = contracts
+        self.ivr_lookback = ivr_lookback
+        self.max_concurrent = max_concurrent
 
     @property
     def name(self) -> str:
@@ -561,6 +594,8 @@ class WheelStrategy(_StrategyMixin, OptionStrategy):
             "dte_target": self.dte_target,
             "put_delta": self.put_delta,
             "call_delta": self.call_delta,
+            "ivr_lookback": self.ivr_lookback,
+            "max_concurrent": self.max_concurrent,
         }
 
     def generate_trades(self, closes, highs, lows, dates, risk_free_rate=0.04):
@@ -571,13 +606,15 @@ class WheelStrategy(_StrategyMixin, OptionStrategy):
         iv_series = generate_iv_series(closes, base_iv=0.20, seed=42)
 
         # State machine: "cash" → "csp_open" → "assigned" → "cc_open" → "cash"
+        # The Wheel is inherently sequential (one stock lot), so we keep the
+        # state-machine approach but honour ivr_lookback for the loop start.
         state = "cash"
         position_entry_idx = 0
         current_position = None
         cost_basis = 0.0  # Track cost basis when assigned
 
-        for i in range(252, n):
-            iv_history = iv_series[max(0, i - 252):i]
+        for i in range(self.ivr_lookback, n):
+            iv_history = iv_series[max(0, i - self.ivr_lookback):i]
             current_iv = iv_series[i]
             ivr = iv_rank(current_iv, iv_history)
             price = closes[i]
@@ -690,7 +727,8 @@ class StraddleStrategy(_StrategyMixin, OptionStrategy):
     def __init__(self, iv_rank_entry: float = 30.0, dte_target: int = 45,
                  dte_exit: int = 14, use_strangle: bool = True,
                  strangle_width: float = 5.0, profit_target: float = 1.0,
-                 stop_loss: float = 0.50, contracts: int = 1):
+                 stop_loss: float = 0.50, contracts: int = 1,
+                 ivr_lookback: int = 60, max_concurrent: int = 3):
         self.iv_rank_entry = iv_rank_entry  # Enter when IV rank BELOW this
         self.dte_target = dte_target
         self.dte_exit = dte_exit
@@ -699,6 +737,8 @@ class StraddleStrategy(_StrategyMixin, OptionStrategy):
         self.profit_target = profit_target  # 100% profit target
         self.stop_loss = stop_loss          # Close if lost 50% of debit
         self.contracts = contracts
+        self.ivr_lookback = ivr_lookback
+        self.max_concurrent = max_concurrent
 
     @property
     def name(self) -> str:
@@ -711,6 +751,8 @@ class StraddleStrategy(_StrategyMixin, OptionStrategy):
             "dte_target": self.dte_target,
             "use_strangle": self.use_strangle,
             "profit_target": self.profit_target,
+            "ivr_lookback": self.ivr_lookback,
+            "max_concurrent": self.max_concurrent,
         }
 
     def generate_trades(self, closes, highs, lows, dates, risk_free_rate=0.04):
@@ -719,47 +761,52 @@ class StraddleStrategy(_StrategyMixin, OptionStrategy):
 
         iv_series = generate_iv_series(closes, base_iv=0.20, seed=42)
 
-        in_position = False
-        position_entry_idx = 0
-        current_position = None
+        open_positions = []
+        last_open_idx = -999
 
-        for i in range(252, n):
-            iv_history = iv_series[max(0, i - 252):i]
+        for i in range(self.ivr_lookback, n):
+            iv_history = iv_series[max(0, i - self.ivr_lookback):i]
             current_iv = iv_series[i]
             ivr = iv_rank(current_iv, iv_history)
             price = closes[i]
             T = self.dte_target / 365.0
 
-            if in_position:
-                days_held = i - position_entry_idx
+            # --- Check exits for all open positions ---
+            still_open = []
+            for entry_idx, pos in open_positions:
+                days_held = i - entry_idx
                 remaining_dte = self.dte_target - days_held
 
+                exited = False
                 if remaining_dte <= self.dte_exit:
-                    current_position.exit_date = dates[i]
-                    pnl = self._straddle_pnl(current_position, price, remaining_dte,
+                    pos.exit_date = dates[i]
+                    pnl = self._straddle_pnl(pos, price, remaining_dte,
                                              iv_series[i], risk_free_rate)
-                    current_position.exit_pnl = pnl
-                    in_position = False
-                    continue
+                    pos.exit_pnl = pnl
+                    exited = True
+                else:
+                    current_value = self._long_position_value(pos, price,
+                                                              remaining_dte, iv_series[i],
+                                                              risk_free_rate)
+                    debit_paid = abs(pos.net_credit)
+                    if debit_paid > 0:
+                        profit = current_value - debit_paid
+                        if profit >= debit_paid * self.profit_target:
+                            pos.exit_date = dates[i]
+                            pos.exit_pnl = profit
+                            exited = True
+                        elif profit <= -debit_paid * self.stop_loss:
+                            pos.exit_date = dates[i]
+                            pos.exit_pnl = profit
+                            exited = True
 
-                # Check profit/loss targets
-                current_value = self._long_position_value(current_position, price,
-                                                          remaining_dte, iv_series[i],
-                                                          risk_free_rate)
-                debit_paid = abs(current_position.net_credit)
-                if debit_paid > 0:
-                    profit = current_value - debit_paid
-                    if profit >= debit_paid * self.profit_target:
-                        current_position.exit_date = dates[i]
-                        current_position.exit_pnl = profit
-                        in_position = False
-                        continue
-                    if profit <= -debit_paid * self.stop_loss:
-                        current_position.exit_date = dates[i]
-                        current_position.exit_pnl = profit
-                        in_position = False
-                        continue
-            else:
+                if not exited:
+                    still_open.append((entry_idx, pos))
+
+            open_positions = still_open
+
+            # --- Check entry ---
+            if len(open_positions) < self.max_concurrent and (i - last_open_idx) >= 5:
                 # Enter when IV is LOW (cheap premium)
                 if ivr <= self.iv_rank_entry:
                     step = 1.0 if price < 200 else 2.0 if price < 500 else 5.0
@@ -790,9 +837,8 @@ class StraddleStrategy(_StrategyMixin, OptionStrategy):
                     )
 
                     positions[i] = position
-                    current_position = position
-                    position_entry_idx = i
-                    in_position = True
+                    open_positions.append((i, position))
+                    last_open_idx = i
 
         return positions
 
@@ -822,24 +868,30 @@ class IVAdaptiveStrategy(OptionStrategy):
 
     def __init__(self, high_iv_threshold: float = 60.0,
                  low_iv_threshold: float = 25.0,
-                 dte_target: int = 30, contracts: int = 1):
+                 dte_target: int = 30, contracts: int = 1,
+                 ivr_lookback: int = 60, max_concurrent: int = 3):
         self.high_iv_threshold = high_iv_threshold
         self.low_iv_threshold = low_iv_threshold
         self.dte_target = dte_target
         self.contracts = contracts
+        self.ivr_lookback = ivr_lookback
+        self.max_concurrent = max_concurrent
 
-        # Sub-strategies
+        # Sub-strategies — pass through ivr_lookback and max_concurrent
         self._ic = IronCondorStrategy(
             iv_rank_entry=high_iv_threshold, dte_target=dte_target,
-            contracts=contracts
+            contracts=contracts, ivr_lookback=ivr_lookback,
+            max_concurrent=max_concurrent,
         )
         self._vs = VerticalSpreadStrategy(
             iv_rank_entry=30.0, dte_target=dte_target,
-            contracts=contracts
+            contracts=contracts, ivr_lookback=ivr_lookback,
+            max_concurrent=max_concurrent,
         )
         self._straddle = StraddleStrategy(
             iv_rank_entry=low_iv_threshold, dte_target=dte_target + 15,
-            contracts=contracts
+            contracts=contracts, ivr_lookback=ivr_lookback,
+            max_concurrent=max_concurrent,
         )
 
     @property
@@ -852,6 +904,8 @@ class IVAdaptiveStrategy(OptionStrategy):
             "high_iv_threshold": self.high_iv_threshold,
             "low_iv_threshold": self.low_iv_threshold,
             "dte_target": self.dte_target,
+            "ivr_lookback": self.ivr_lookback,
+            "max_concurrent": self.max_concurrent,
         }
 
     def generate_trades(self, closes, highs, lows, dates, risk_free_rate=0.04):
@@ -867,31 +921,40 @@ class IVAdaptiveStrategy(OptionStrategy):
 
         # Merge: pick the one that matches current regime
         positions = [None] * n
-        in_position = False
-        position_exit_day = 0
+        open_positions = []  # list of (entry_idx, dte_target)
+        last_open_idx = -999
 
-        for i in range(252, n):
-            if in_position and i < position_exit_day:
+        for i in range(self.ivr_lookback, n):
+            # Expire tracked positions
+            open_positions = [(eidx, dte) for eidx, dte in open_positions
+                              if (i - eidx) < dte]
+
+            if len(open_positions) >= self.max_concurrent:
                 continue
-            in_position = False
+            if (i - last_open_idx) < 5:
+                continue
 
-            iv_history = iv_series[max(0, i - 252):i]
+            iv_history = iv_series[max(0, i - self.ivr_lookback):i]
             current_iv = iv_series[i]
             ivr = iv_rank(current_iv, iv_history)
 
             # Pick strategy based on IV regime
             selected = None
+            selected_dte = self.dte_target
             if ivr >= self.high_iv_threshold and ic_trades[i] is not None:
                 selected = ic_trades[i]
+                selected_dte = self._ic.dte_target
             elif ivr <= self.low_iv_threshold and st_trades[i] is not None:
                 selected = st_trades[i]
+                selected_dte = self._straddle.dte_target
             elif vs_trades[i] is not None:
                 selected = vs_trades[i]
+                selected_dte = self._vs.dte_target
 
             if selected is not None:
                 positions[i] = selected
-                in_position = True
-                position_exit_day = i + self.dte_target
+                open_positions.append((i, selected_dte))
+                last_open_idx = i
 
         return positions
 
@@ -928,7 +991,8 @@ class ButterflySpreadStrategy(_StrategyMixin, OptionStrategy):
                  wing_width: float = 5.0,
                  profit_target: float = 0.75,
                  stop_loss_mult: float = 1.50,
-                 contracts: int = 1):
+                 contracts: int = 1,
+                 ivr_lookback: int = 60, max_concurrent: int = 3):
         self.low_iv_threshold = low_iv_threshold
         self.high_iv_threshold = high_iv_threshold
         self.dte_target = dte_target
@@ -937,6 +1001,8 @@ class ButterflySpreadStrategy(_StrategyMixin, OptionStrategy):
         self.profit_target = profit_target  # Close at 75% of max profit
         self.stop_loss_mult = stop_loss_mult  # Close if loss > 1.5× debit
         self.contracts = contracts
+        self.ivr_lookback = ivr_lookback
+        self.max_concurrent = max_concurrent
 
     @property
     def name(self) -> str:
@@ -950,6 +1016,8 @@ class ButterflySpreadStrategy(_StrategyMixin, OptionStrategy):
             "dte_target": self.dte_target,
             "wing_width": self.wing_width,
             "profit_target": self.profit_target,
+            "ivr_lookback": self.ivr_lookback,
+            "max_concurrent": self.max_concurrent,
         }
 
     def generate_trades(self, closes, highs, lows, dates, risk_free_rate=0.04):
@@ -958,50 +1026,54 @@ class ButterflySpreadStrategy(_StrategyMixin, OptionStrategy):
 
         iv_series = generate_iv_series(closes, base_iv=0.20, seed=42)
 
-        in_position = False
-        position_entry_idx = 0
-        current_position = None
+        open_positions = []
+        last_open_idx = -999
 
-        for i in range(252, n):
-            iv_history = iv_series[max(0, i - 252):i]
+        for i in range(self.ivr_lookback, n):
+            iv_history = iv_series[max(0, i - self.ivr_lookback):i]
             current_iv = iv_series[i]
             ivr = iv_rank(current_iv, iv_history)
             price = closes[i]
             T = self.dte_target / 365.0
 
-            if in_position:
-                days_held = i - position_entry_idx
+            # --- Check exits for all open positions ---
+            still_open = []
+            for entry_idx, pos in open_positions:
+                days_held = i - entry_idx
                 remaining_dte = self.dte_target - days_held
 
+                exited = False
                 if remaining_dte <= self.dte_exit:
-                    current_position.exit_date = dates[i]
-                    pnl = self._butterfly_pnl(current_position, price,
+                    pos.exit_date = dates[i]
+                    pnl = self._butterfly_pnl(pos, price,
                                               remaining_dte, iv_series[i], risk_free_rate)
-                    current_position.exit_pnl = pnl
-                    in_position = False
-                    continue
+                    pos.exit_pnl = pnl
+                    exited = True
+                else:
+                    current_val = self._butterfly_current_value(
+                        pos, price, remaining_dte, iv_series[i], risk_free_rate
+                    )
+                    debit_paid = abs(pos.net_credit)
+                    max_profit_est = self.wing_width * self.contracts * 100 - debit_paid
 
-                # Profit / stop-loss check
-                current_val = self._butterfly_current_value(
-                    current_position, price, remaining_dte, iv_series[i], risk_free_rate
-                )
-                debit_paid = abs(current_position.net_credit)
-                max_profit_est = self.wing_width * self.contracts * 100 - debit_paid
+                    if debit_paid > 0 and max_profit_est > 0:
+                        pnl_now = current_val - debit_paid
+                        if pnl_now >= max_profit_est * self.profit_target:
+                            pos.exit_date = dates[i]
+                            pos.exit_pnl = pnl_now
+                            exited = True
+                        elif pnl_now <= -debit_paid * self.stop_loss_mult:
+                            pos.exit_date = dates[i]
+                            pos.exit_pnl = pnl_now
+                            exited = True
 
-                if debit_paid > 0 and max_profit_est > 0:
-                    pnl_now = current_val - debit_paid
-                    if pnl_now >= max_profit_est * self.profit_target:
-                        current_position.exit_date = dates[i]
-                        current_position.exit_pnl = pnl_now
-                        in_position = False
-                        continue
-                    if pnl_now <= -debit_paid * self.stop_loss_mult:
-                        current_position.exit_date = dates[i]
-                        current_position.exit_pnl = pnl_now
-                        in_position = False
-                        continue
+                if not exited:
+                    still_open.append((entry_idx, pos))
 
-            else:
+            open_positions = still_open
+
+            # --- Check entry ---
+            if len(open_positions) < self.max_concurrent and (i - last_open_idx) >= 5:
                 # Entry: moderate IV regime (not too high, not too low)
                 if self.low_iv_threshold <= ivr <= self.high_iv_threshold:
                     step = 1.0 if price < 200 else 2.0 if price < 500 else 5.0
@@ -1043,9 +1115,8 @@ class ButterflySpreadStrategy(_StrategyMixin, OptionStrategy):
                     )
 
                     positions[i] = position
-                    current_position = position
-                    position_entry_idx = i
-                    in_position = True
+                    open_positions.append((i, position))
+                    last_open_idx = i
 
         return positions
 
@@ -1092,24 +1163,22 @@ class PCREnhancedStrategy(_StrategyMixin, OptionStrategy):
        Entry only when current IV is ABOVE its 20-day mean + 1.5σ.
        IV spike → mean-reversion edge → sell premium before vol crush.
 
-    Combined entry requirements:
-        IVR >= iv_rank_entry          (standard IV rank gate)
-        PCR >= PCR upper band         (extreme put-buying = fear confirmation)
-        IV  >= VIX upper band         (IV spike above band = vol elevation)
-
-    This triple-filter dramatically reduces trade frequency but improves
-    the quality of entries (better premium, higher POP, less IV crush risk).
+    Combined entry requirements (gates are optional with relaxed defaults):
+        IVR >= iv_rank_entry          (standard IV rank gate — always on)
+        PCR >= PCR upper band         (optional, default OFF)
+        IV  >= VIX upper band         (optional, default OFF)
 
     Exit: Same as Iron Condor (DTE, profit target, stop loss).
     """
 
-    def __init__(self, iv_rank_entry: float = 50.0,
+    def __init__(self, iv_rank_entry: float = 40.0,
                  dte_target: int = 45, dte_exit: int = 21,
                  short_delta: float = 0.16, wing_width: float = 5.0,
                  profit_target: float = 0.50, stop_loss: float = 2.0,
                  pcr_window: int = 20, vix_window: int = 20,
-                 require_pcr: bool = True, require_vix_band: bool = True,
-                 contracts: int = 1):
+                 require_pcr: bool = False, require_vix_band: bool = False,
+                 contracts: int = 1,
+                 ivr_lookback: int = 60, max_concurrent: int = 3):
         self.iv_rank_entry = iv_rank_entry
         self.dte_target = dte_target
         self.dte_exit = dte_exit
@@ -1122,6 +1191,8 @@ class PCREnhancedStrategy(_StrategyMixin, OptionStrategy):
         self.require_pcr = require_pcr
         self.require_vix_band = require_vix_band
         self.contracts = contracts
+        self.ivr_lookback = ivr_lookback
+        self.max_concurrent = max_concurrent
 
     @property
     def name(self) -> str:
@@ -1136,6 +1207,8 @@ class PCREnhancedStrategy(_StrategyMixin, OptionStrategy):
             "wing_width": self.wing_width,
             "require_pcr": self.require_pcr,
             "require_vix_band": self.require_vix_band,
+            "ivr_lookback": self.ivr_lookback,
+            "max_concurrent": self.max_concurrent,
         }
 
     def generate_trades(self, closes, highs, lows, dates, risk_free_rate=0.04):
@@ -1147,61 +1220,66 @@ class PCREnhancedStrategy(_StrategyMixin, OptionStrategy):
         pcr_signals = generate_pcr_signals(pcr_series, window=self.pcr_window)
         vix_bands = generate_vix_bands(iv_series, window=self.vix_window)
 
-        in_position = False
-        position_entry_idx = 0
-        current_position = None
+        open_positions = []
+        last_open_idx = -999
 
-        for i in range(252, n):
-            iv_history = iv_series[max(0, i - 252):i]
+        for i in range(self.ivr_lookback, n):
+            iv_history = iv_series[max(0, i - self.ivr_lookback):i]
             current_iv = iv_series[i]
             ivr = iv_rank(current_iv, iv_history)
             price = closes[i]
             T = self.dte_target / 365.0
 
-            if in_position:
-                days_held = i - position_entry_idx
+            # --- Check exits for all open positions ---
+            still_open = []
+            for entry_idx, pos in open_positions:
+                days_held = i - entry_idx
                 remaining_dte = self.dte_target - days_held
 
+                exited = False
                 if remaining_dte <= self.dte_exit:
-                    current_position.exit_date = dates[i]
-                    pnl = self._calc_pnl(current_position, price, remaining_dte,
+                    pos.exit_date = dates[i]
+                    pnl = self._calc_pnl(pos, price, remaining_dte,
                                          iv_series[i], risk_free_rate)
-                    current_position.exit_pnl = pnl
-                    in_position = False
-                    continue
+                    pos.exit_pnl = pnl
+                    exited = True
+                else:
+                    current_value = self._position_value(
+                        pos, price, remaining_dte, iv_series[i], risk_free_rate
+                    )
+                    credit = pos.net_credit
+                    if credit > 0:
+                        profit_pct = (credit - current_value) / credit
+                        if profit_pct >= self.profit_target:
+                            pos.exit_date = dates[i]
+                            pos.exit_pnl = credit - current_value
+                            exited = True
+                        elif current_value > credit * self.stop_loss:
+                            pos.exit_date = dates[i]
+                            pos.exit_pnl = credit - current_value
+                            exited = True
 
-                current_value = self._position_value(
-                    current_position, price, remaining_dte, iv_series[i], risk_free_rate
-                )
-                credit = current_position.net_credit
-                if credit > 0:
-                    profit_pct = (credit - current_value) / credit
-                    if profit_pct >= self.profit_target:
-                        current_position.exit_date = dates[i]
-                        current_position.exit_pnl = credit - current_value
-                        in_position = False
-                        continue
-                    if current_value > credit * self.stop_loss:
-                        current_position.exit_date = dates[i]
-                        current_position.exit_pnl = credit - current_value
-                        in_position = False
-                        continue
+                if not exited:
+                    still_open.append((entry_idx, pos))
 
-            else:
+            open_positions = still_open
+
+            # --- Check entry ---
+            if len(open_positions) < self.max_concurrent and (i - last_open_idx) >= 5:
                 # Gate 1: Standard IV rank
                 if ivr < self.iv_rank_entry:
                     continue
 
-                # Gate 2: PCR confirmation (extreme fear = high PCR)
+                # Gate 2: PCR confirmation (optional — default OFF)
                 if self.require_pcr and pcr_signals[i].signal != 1:
                     continue
 
-                # Gate 3: VIX band — IV above its upper band
+                # Gate 3: VIX band (optional — default OFF)
                 vix_mean, vix_upper, vix_lower = vix_bands[i]
                 if self.require_vix_band and current_iv < vix_upper:
                     continue
 
-                # All gates passed → build Iron Condor
+                # All active gates passed → build Iron Condor
                 put_strike = self._find_strike_by_delta(
                     price, T, risk_free_rate, current_iv,
                     target_delta=-self.short_delta, option_type="put"
@@ -1239,8 +1317,391 @@ class PCREnhancedStrategy(_StrategyMixin, OptionStrategy):
                 )
 
                 positions[i] = position
-                current_position = position
-                position_entry_idx = i
-                in_position = True
+                open_positions.append((i, position))
+                last_open_idx = i
+
+        return positions
+
+
+# ── TA-Driven Strategy ──────────────────────────────────────────────────────
+
+class TADrivenStrategy(_StrategyMixin, OptionStrategy):
+    """Technical-Analysis-driven option strategy.
+
+    Uses MACD (12/26/9), RSI (14), and Bollinger Bands (20, 2sigma) on the
+    underlying price to generate option trade signals.  No IV-rank gate --
+    entries are purely TA-driven.
+
+    Signal logic:
+        1. MACD bullish cross + RSI < 70 + price near lower BB
+           → Bull Put Spread (credit)
+        2. MACD bearish cross + RSI > 30 + price near upper BB
+           → Bear Call Spread (credit)
+        3. RSI < 25 (deep oversold)
+           → Buy Call (debit)
+        4. RSI > 75 (deep overbought)
+           → Buy Put (debit)
+        5. Bollinger squeeze (bandwidth < 20th percentile of last 100 days)
+           + any MACD cross on that day
+           → Long Straddle (debit)
+
+    Exit mechanics: DTE exit, profit target, stop loss — same as other
+    strategies.
+    """
+
+    def __init__(self, dte_target: int = 30, dte_exit: int = 10,
+                 spread_width: float = 5.0, short_delta: float = 0.30,
+                 profit_target: float = 0.65, stop_loss: float = 0.50,
+                 contracts: int = 1,
+                 # MACD parameters
+                 macd_fast: int = 12, macd_slow: int = 26, macd_signal: int = 9,
+                 # RSI parameters
+                 rsi_period: int = 14,
+                 # Bollinger Band parameters
+                 bb_period: int = 20, bb_std: float = 2.0,
+                 # "near band" threshold — fraction of band width
+                 bb_near_pct: float = 0.10,
+                 # Squeeze percentile
+                 squeeze_percentile: float = 20.0,
+                 ivr_lookback: int = 60, max_concurrent: int = 3):
+        self.dte_target = dte_target
+        self.dte_exit = dte_exit
+        self.spread_width = spread_width
+        self.short_delta = short_delta
+        self.profit_target = profit_target
+        self.stop_loss = stop_loss
+        self.contracts = contracts
+        self.macd_fast = macd_fast
+        self.macd_slow = macd_slow
+        self.macd_signal = macd_signal
+        self.rsi_period = rsi_period
+        self.bb_period = bb_period
+        self.bb_std = bb_std
+        self.bb_near_pct = bb_near_pct
+        self.squeeze_percentile = squeeze_percentile
+        self.ivr_lookback = ivr_lookback
+        self.max_concurrent = max_concurrent
+
+    @property
+    def name(self) -> str:
+        return "TA-Driven"
+
+    @property
+    def params(self) -> Dict:
+        return {
+            "dte_target": self.dte_target,
+            "spread_width": self.spread_width,
+            "short_delta": self.short_delta,
+            "profit_target": self.profit_target,
+            "stop_loss": self.stop_loss,
+            "macd_fast": self.macd_fast,
+            "macd_slow": self.macd_slow,
+            "macd_signal": self.macd_signal,
+            "rsi_period": self.rsi_period,
+            "bb_period": self.bb_period,
+            "bb_std": self.bb_std,
+            "ivr_lookback": self.ivr_lookback,
+            "max_concurrent": self.max_concurrent,
+        }
+
+    # ── Technical indicator helpers ──────────────────────────────────────
+
+    @staticmethod
+    def _ema(values: List[float], period: int) -> List[float]:
+        """Exponential Moving Average."""
+        result = [0.0] * len(values)
+        if len(values) == 0 or period <= 0:
+            return result
+        k = 2.0 / (period + 1)
+        result[0] = values[0]
+        for i in range(1, len(values)):
+            result[i] = values[i] * k + result[i - 1] * (1 - k)
+        return result
+
+    def _compute_macd(self, closes: List[float]) -> Tuple[List[float], List[float], List[float]]:
+        """Return (macd_line, signal_line, histogram)."""
+        ema_fast = self._ema(closes, self.macd_fast)
+        ema_slow = self._ema(closes, self.macd_slow)
+        macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
+        signal_line = self._ema(macd_line, self.macd_signal)
+        histogram = [m - s for m, s in zip(macd_line, signal_line)]
+        return macd_line, signal_line, histogram
+
+    def _compute_rsi(self, closes: List[float]) -> List[float]:
+        """Relative Strength Index (Wilder's smoothed)."""
+        n = len(closes)
+        rsi = [50.0] * n  # neutral default
+        if n < self.rsi_period + 1:
+            return rsi
+
+        # Initial average gain/loss over first rsi_period
+        gains = 0.0
+        losses = 0.0
+        for j in range(1, self.rsi_period + 1):
+            change = closes[j] - closes[j - 1]
+            if change > 0:
+                gains += change
+            else:
+                losses -= change  # make positive
+
+        avg_gain = gains / self.rsi_period
+        avg_loss = losses / self.rsi_period
+
+        if avg_loss == 0:
+            rsi[self.rsi_period] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi[self.rsi_period] = 100.0 - 100.0 / (1.0 + rs)
+
+        for j in range(self.rsi_period + 1, n):
+            change = closes[j] - closes[j - 1]
+            gain = max(change, 0.0)
+            loss = max(-change, 0.0)
+            avg_gain = (avg_gain * (self.rsi_period - 1) + gain) / self.rsi_period
+            avg_loss = (avg_loss * (self.rsi_period - 1) + loss) / self.rsi_period
+            if avg_loss == 0:
+                rsi[j] = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi[j] = 100.0 - 100.0 / (1.0 + rs)
+
+        return rsi
+
+    def _compute_bollinger(self, closes: List[float]) -> Tuple[List[float], List[float], List[float], List[float]]:
+        """Return (middle_band, upper_band, lower_band, bandwidth)."""
+        n = len(closes)
+        mid = [0.0] * n
+        upper = [0.0] * n
+        lower = [0.0] * n
+        bandwidth = [0.0] * n
+
+        for i in range(self.bb_period - 1, n):
+            window = closes[i - self.bb_period + 1:i + 1]
+            mean = sum(window) / self.bb_period
+            var = sum((x - mean) ** 2 for x in window) / self.bb_period
+            std = math.sqrt(var) if var > 0 else 0.0
+            mid[i] = mean
+            upper[i] = mean + self.bb_std * std
+            lower[i] = mean - self.bb_std * std
+            bandwidth[i] = (upper[i] - lower[i]) / mean if mean > 0 else 0.0
+
+        return mid, upper, lower, bandwidth
+
+    # ── Main trade generation ────────────────────────────────────────────
+
+    def generate_trades(self, closes, highs, lows, dates, risk_free_rate=0.04):
+        n = len(closes)
+        positions = [None] * n
+
+        iv_series = generate_iv_series(closes, base_iv=0.20, seed=42)
+
+        # Pre-compute indicators
+        macd_line, signal_line, histogram = self._compute_macd(closes)
+        rsi = self._compute_rsi(closes)
+        bb_mid, bb_upper, bb_lower, bb_bw = self._compute_bollinger(closes)
+
+        open_positions = []  # list of (entry_idx, position, position_type)
+        last_open_idx = -999
+
+        # Minimum warm-up: need enough bars for all indicators
+        min_start = max(self.macd_slow + self.macd_signal, self.rsi_period + 1,
+                        self.bb_period, self.ivr_lookback)
+
+        for i in range(min_start, n):
+            price = closes[i]
+            current_iv = iv_series[i]
+            T = self.dte_target / 365.0
+
+            # --- Check exits for all open positions ---
+            still_open = []
+            for entry_idx, pos, pos_type in open_positions:
+                days_held = i - entry_idx
+                remaining_dte = self.dte_target - days_held
+
+                exited = False
+                if remaining_dte <= self.dte_exit:
+                    pos.exit_date = dates[i]
+                    if pos_type in ("long_call", "long_put", "long_straddle"):
+                        pnl = self._long_position_value(pos, price, remaining_dte,
+                                                        iv_series[i], risk_free_rate) - abs(pos.net_credit)
+                    else:
+                        pnl = self._calc_pnl(pos, price, remaining_dte,
+                                             iv_series[i], risk_free_rate)
+                    pos.exit_pnl = pnl
+                    exited = True
+                else:
+                    if pos_type in ("long_call", "long_put", "long_straddle"):
+                        current_value = self._long_position_value(pos, price,
+                                                                   remaining_dte, iv_series[i],
+                                                                   risk_free_rate)
+                        debit_paid = abs(pos.net_credit)
+                        if debit_paid > 0:
+                            profit = current_value - debit_paid
+                            if profit >= debit_paid * self.profit_target:
+                                pos.exit_date = dates[i]
+                                pos.exit_pnl = profit
+                                exited = True
+                            elif profit <= -debit_paid * self.stop_loss:
+                                pos.exit_date = dates[i]
+                                pos.exit_pnl = profit
+                                exited = True
+                    else:
+                        # Credit spread exit
+                        current_value = self._position_value(pos, price,
+                                                              remaining_dte, iv_series[i],
+                                                              risk_free_rate)
+                        credit = pos.net_credit
+                        if credit > 0:
+                            profit_pct = (credit - current_value) / credit
+                            if profit_pct >= self.profit_target:
+                                pos.exit_date = dates[i]
+                                pos.exit_pnl = credit - current_value
+                                exited = True
+                            elif current_value > credit * 2.0:
+                                pos.exit_date = dates[i]
+                                pos.exit_pnl = credit - current_value
+                                exited = True
+
+                if not exited:
+                    still_open.append((entry_idx, pos, pos_type))
+
+            open_positions = still_open
+
+            # --- Check entry ---
+            if len(open_positions) >= self.max_concurrent:
+                continue
+            if (i - last_open_idx) < 5:
+                continue
+
+            # Detect MACD crosses
+            macd_bullish_cross = (histogram[i] > 0 and histogram[i - 1] <= 0)
+            macd_bearish_cross = (histogram[i] < 0 and histogram[i - 1] >= 0)
+            macd_any_cross = macd_bullish_cross or macd_bearish_cross
+
+            # "Near" band detection
+            bb_width = bb_upper[i] - bb_lower[i]
+            near_lower = (price - bb_lower[i]) <= bb_width * self.bb_near_pct if bb_width > 0 else False
+            near_upper = (bb_upper[i] - price) <= bb_width * self.bb_near_pct if bb_width > 0 else False
+
+            # Bollinger squeeze detection
+            is_squeeze = False
+            if i >= 100:
+                recent_bw = bb_bw[i - 99:i + 1]
+                sorted_bw = sorted(recent_bw)
+                pct_idx = max(0, int(len(sorted_bw) * self.squeeze_percentile / 100.0) - 1)
+                threshold = sorted_bw[pct_idx]
+                is_squeeze = bb_bw[i] <= threshold
+
+            # --- Signal priority (first match wins) ---
+            position = None
+            pos_type = None
+
+            # Signal 5: Bollinger squeeze + MACD cross → Long Straddle
+            if is_squeeze and macd_any_cross:
+                step = 1.0 if price < 200 else 2.0 if price < 500 else 5.0
+                atm_strike = round(price / step) * step
+                call_prem = call_price(price, atm_strike, T, risk_free_rate, current_iv)
+                put_prem = put_price(price, atm_strike, T, risk_free_rate, current_iv)
+                position = OptionPosition(
+                    strategy_name="long_straddle",
+                    underlying_price=price,
+                    entry_date=dates[i],
+                    legs=[
+                        OptionTrade("call", "buy", atm_strike, call_prem,
+                                    self.contracts, self.dte_target, current_iv,
+                                    delta(price, atm_strike, T, risk_free_rate, current_iv, "call")),
+                        OptionTrade("put", "buy", atm_strike, put_prem,
+                                    self.contracts, self.dte_target, current_iv,
+                                    delta(price, atm_strike, T, risk_free_rate, current_iv, "put")),
+                    ]
+                )
+                pos_type = "long_straddle"
+
+            # Signal 3: RSI < 25 → Buy Call
+            elif rsi[i] < 25:
+                step = 1.0 if price < 200 else 2.0 if price < 500 else 5.0
+                atm_strike = round(price / step) * step
+                prem = call_price(price, atm_strike, T, risk_free_rate, current_iv)
+                position = OptionPosition(
+                    strategy_name="long_call",
+                    underlying_price=price,
+                    entry_date=dates[i],
+                    legs=[
+                        OptionTrade("call", "buy", atm_strike, prem,
+                                    self.contracts, self.dte_target, current_iv,
+                                    delta(price, atm_strike, T, risk_free_rate, current_iv, "call")),
+                    ]
+                )
+                pos_type = "long_call"
+
+            # Signal 4: RSI > 75 → Buy Put
+            elif rsi[i] > 75:
+                step = 1.0 if price < 200 else 2.0 if price < 500 else 5.0
+                atm_strike = round(price / step) * step
+                prem = put_price(price, atm_strike, T, risk_free_rate, current_iv)
+                position = OptionPosition(
+                    strategy_name="long_put",
+                    underlying_price=price,
+                    entry_date=dates[i],
+                    legs=[
+                        OptionTrade("put", "buy", atm_strike, prem,
+                                    self.contracts, self.dte_target, current_iv,
+                                    delta(price, atm_strike, T, risk_free_rate, current_iv, "put")),
+                    ]
+                )
+                pos_type = "long_put"
+
+            # Signal 1: MACD bullish cross + RSI < 70 + near lower BB → Bull Put Spread
+            elif macd_bullish_cross and rsi[i] < 70 and near_lower:
+                short_strike = self._find_strike_by_delta(
+                    price, T, risk_free_rate, current_iv,
+                    target_delta=self.short_delta, option_type="put"
+                )
+                long_strike = short_strike - self.spread_width
+                short_prem = put_price(price, short_strike, T, risk_free_rate, current_iv)
+                long_prem = put_price(price, long_strike, T, risk_free_rate, current_iv)
+                position = OptionPosition(
+                    strategy_name="bull_put_spread",
+                    underlying_price=price,
+                    entry_date=dates[i],
+                    legs=[
+                        OptionTrade("put", "sell", short_strike, short_prem,
+                                    self.contracts, self.dte_target, current_iv,
+                                    delta(price, short_strike, T, risk_free_rate, current_iv, "put")),
+                        OptionTrade("put", "buy", long_strike, long_prem,
+                                    self.contracts, self.dte_target, current_iv,
+                                    delta(price, long_strike, T, risk_free_rate, current_iv, "put")),
+                    ]
+                )
+                pos_type = "bull_put_spread"
+
+            # Signal 2: MACD bearish cross + RSI > 30 + near upper BB → Bear Call Spread
+            elif macd_bearish_cross and rsi[i] > 30 and near_upper:
+                short_strike = self._find_strike_by_delta(
+                    price, T, risk_free_rate, current_iv,
+                    target_delta=self.short_delta, option_type="call"
+                )
+                long_strike = short_strike + self.spread_width
+                short_prem = call_price(price, short_strike, T, risk_free_rate, current_iv)
+                long_prem = call_price(price, long_strike, T, risk_free_rate, current_iv)
+                position = OptionPosition(
+                    strategy_name="bear_call_spread",
+                    underlying_price=price,
+                    entry_date=dates[i],
+                    legs=[
+                        OptionTrade("call", "sell", short_strike, short_prem,
+                                    self.contracts, self.dte_target, current_iv,
+                                    delta(price, short_strike, T, risk_free_rate, current_iv, "call")),
+                        OptionTrade("call", "buy", long_strike, long_prem,
+                                    self.contracts, self.dte_target, current_iv,
+                                    delta(price, long_strike, T, risk_free_rate, current_iv, "call")),
+                    ]
+                )
+                pos_type = "bear_call_spread"
+
+            if position is not None:
+                positions[i] = position
+                open_positions.append((i, position, pos_type))
+                last_open_idx = i
 
         return positions

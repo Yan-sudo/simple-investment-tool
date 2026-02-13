@@ -134,7 +134,7 @@ def render_sidebar():
 
     mode = st.sidebar.radio(
         "Mode / 模式",
-        ["Stock Strategies", "Option Strategies", "Alpaca Live"],
+        ["Stock Strategies", "Option Strategies", "Live Simulation", "Alpaca Live"],
         index=0,
     )
 
@@ -544,7 +544,7 @@ def page_options(cfg):
         from options.strategies import (
             IronCondorStrategy, VerticalSpreadStrategy, WheelStrategy,
             StraddleStrategy, IVAdaptiveStrategy,
-            ButterflySpreadStrategy, PCREnhancedStrategy,
+            ButterflySpreadStrategy, PCREnhancedStrategy, TADrivenStrategy,
         )
     except ImportError as e:
         st.error(f"Options module import error: {e}")
@@ -553,13 +553,13 @@ def page_options(cfg):
     OPTION_STRATS = {
         "Iron Condor (铁鹰)": {
             "class": IronCondorStrategy,
-            "defaults": {"iv_rank_entry": 50.0, "dte_target": 45,
+            "defaults": {"iv_rank_entry": 40.0, "dte_target": 45,
                          "short_delta": 0.16, "wing_width": 5.0},
         },
         "Vertical Spread (垂直价差)": {
             "class": VerticalSpreadStrategy,
             "defaults": {"ma_fast": 20, "ma_slow": 50,
-                         "iv_rank_entry": 40.0, "spread_width": 5.0},
+                         "iv_rank_entry": 30.0, "spread_width": 5.0},
         },
         "Wheel (轮动)": {
             "class": WheelStrategy,
@@ -584,9 +584,14 @@ def page_options(cfg):
         },
         "PCR-Enhanced IC (PCR增强铁鹰)": {
             "class": PCREnhancedStrategy,
-            "defaults": {"iv_rank_entry": 50.0, "dte_target": 45,
+            "defaults": {"iv_rank_entry": 40.0, "dte_target": 45,
                          "short_delta": 0.16, "wing_width": 5.0,
                          "require_pcr": True, "require_vix_band": True},
+        },
+        "TA-Driven (技术分析)": {
+            "class": TADrivenStrategy,
+            "defaults": {"dte_target": 30, "profit_target": 0.50,
+                         "stop_loss": 0.50},
         },
     }
 
@@ -966,6 +971,132 @@ def page_alpaca(cfg):
                 st.error(f"Error: {e}")
 
 
+# ── Page: Live Simulation ────────────────────────────────────────────────────
+
+def page_live_sim(cfg):
+    st.markdown("# 🔴 Live Market Simulation")
+    st.caption(
+        "Simulates real-time trading using recent synthetic data "
+        "(or Alpaca API if configured). Runs strategies on current market conditions."
+    )
+
+    try:
+        from data.live_simulator import LiveSimulator, generate_live_simulation
+    except ImportError as e:
+        st.error(f"Failed to import live_simulator: {e}")
+        return
+
+    try:
+        from options.strategies import (
+            IronCondorStrategy, VerticalSpreadStrategy, WheelStrategy,
+            StraddleStrategy, IVAdaptiveStrategy,
+            ButterflySpreadStrategy, PCREnhancedStrategy, TADrivenStrategy,
+        )
+    except ImportError as e:
+        st.error(f"Options strategies import error: {e}")
+        return
+
+    LIVE_STRATS = {
+        "Iron Condor": IronCondorStrategy,
+        "Vertical Spread": VerticalSpreadStrategy,
+        "Wheel": WheelStrategy,
+        "Long Strangle": StraddleStrategy,
+        "IV-Adaptive": IVAdaptiveStrategy,
+        "Butterfly": ButterflySpreadStrategy,
+        "PCR-Enhanced IC": PCREnhancedStrategy,
+        "TA-Driven": TADrivenStrategy,
+    }
+
+    col_s, col_d = st.columns(2)
+    with col_s:
+        strat_name = st.selectbox("Strategy / 策略", list(LIVE_STRATS.keys()))
+    with col_d:
+        sim_days = st.slider("Simulation Days / 模拟天数", 200, 1500, 750)
+
+    if st.button("🔴 Run Live Simulation / 运行实时模拟", type="primary",
+                  use_container_width=True):
+        with st.spinner("Running live simulation..."):
+            sim = LiveSimulator(
+                symbol=cfg["symbol"],
+                initial_capital=cfg["capital"],
+            )
+
+            data = sim.fetch_current_data(days=sim_days, seed=cfg["seed"])
+            strategy = LIVE_STRATS[strat_name]()
+            result = sim.run_live_backtest(strategy, data)
+
+        # Market snapshot
+        st.markdown("---")
+        st.markdown("### Market Snapshot / 市场快照")
+        snapshots = sim.get_snapshots(data)
+        if snapshots:
+            latest = snapshots[-1]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Price", f"${latest.price:.2f}",
+                       delta=f"{latest.change_pct:+.2f}%")
+            m2.metric("IV Estimate", f"{latest.iv_estimate:.1%}")
+            m3.metric("IV Rank", f"{latest.ivr_estimate:.0f}")
+            m4.metric("Date", latest.timestamp[:10])
+
+        # KPIs
+        st.markdown("### Strategy Performance / 策略表现")
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        k1.metric("Return", f"{result.total_return_pct:+.2f}%")
+        k2.metric("Sharpe", f"{result.sharpe_ratio:.2f}")
+        k3.metric("Max DD", f"{result.max_drawdown_pct:.2f}%")
+        k4.metric("Win Rate", f"{result.win_rate:.1f}%")
+        k5.metric("Trades", f"{result.positions_closed}")
+        k6.metric("Calmar", f"{result.calmar_ratio:.2f}")
+
+        # Equity chart
+        st.plotly_chart(build_option_equity_chart(result), use_container_width=True)
+
+        # Price chart with snapshots
+        if snapshots:
+            fig_price = go.Figure()
+            snap_dates = [s.timestamp[:10] for s in snapshots]
+            snap_prices = [s.price for s in snapshots]
+            snap_iv = [s.iv_estimate * 100 for s in snapshots]
+
+            fig_price.add_trace(go.Scatter(
+                x=snap_dates, y=snap_prices, name="Price",
+                line=dict(color="#00D4AA", width=2),
+            ))
+            fig_price.add_trace(go.Scatter(
+                x=snap_dates, y=snap_iv, name="IV %",
+                yaxis="y2", line=dict(color="#FFB74D", width=1, dash="dot"),
+            ))
+            fig_price.update_layout(
+                height=350, template="plotly_dark",
+                paper_bgcolor=CHART_COLORS["paper"],
+                plot_bgcolor=CHART_COLORS["bg"],
+                margin=dict(l=50, r=50, t=20, b=30),
+                yaxis=dict(title="Price", gridcolor=CHART_COLORS["grid"],
+                           tickprefix="$"),
+                yaxis2=dict(title="IV %", overlaying="y", side="right",
+                            gridcolor=CHART_COLORS["grid"], ticksuffix="%"),
+                legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"),
+            )
+            st.plotly_chart(fig_price, use_container_width=True)
+
+        # Trade log
+        if result.trades:
+            st.markdown("### Trade Log / 交易记录")
+            rows = []
+            for t in result.trades:
+                rows.append({
+                    "Entry": t.entry_date,
+                    "Exit": t.exit_date,
+                    "Type": t.strategy_name,
+                    "P&L": f"${t.exit_pnl:+,.0f}",
+                    "P&L %": f"{t.pnl_pct:+.1f}%",
+                    "Days": t.holding_days,
+                    "Reason": t.exit_reason,
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                          hide_index=True)
+
+
 # ── Main App ─────────────────────────────────────────────────────────────────
 
 def main():
@@ -975,6 +1106,8 @@ def main():
         page_stock(cfg)
     elif cfg["mode"] == "Option Strategies":
         page_options(cfg)
+    elif cfg["mode"] == "Live Simulation":
+        page_live_sim(cfg)
     elif cfg["mode"] == "Alpaca Live":
         page_alpaca(cfg)
 

@@ -18,6 +18,7 @@ from options.strategies import (
     OptionStrategy, OptionPosition, OptionTrade,
     IronCondorStrategy, VerticalSpreadStrategy, WheelStrategy,
     StraddleStrategy, IVAdaptiveStrategy,
+    ButterflySpreadStrategy, PCREnhancedStrategy,
 )
 from options.iv_model import (
     historical_volatility, generate_iv_series, iv_rank, iv_percentile,
@@ -227,6 +228,21 @@ class OptionBacktestEngine:
                 S, call_leg.strike, put_leg.strike, T, iv, hv
             )
 
+        elif pos.strategy_name == "pcr_enhanced_ic" and len(pos.legs) == 4:
+            # Same EV logic as regular IC
+            put_legs = sorted([l for l in pos.legs if l.option_type == "put"],
+                              key=lambda l: l.strike, reverse=True)
+            call_legs = sorted([l for l in pos.legs if l.option_type == "call"],
+                               key=lambda l: l.strike)
+            if len(put_legs) >= 2 and len(call_legs) >= 2:
+                return self.ev_analyzer.analyze_iron_condor(
+                    S, put_legs[0].strike, put_legs[1].strike,
+                    call_legs[0].strike, call_legs[1].strike,
+                    T, iv, hv
+                )
+
+        # For butterfly, TA-driven debit strategies, and others: skip EV filter
+        # (debit strategies are not well modelled by the credit EV framework)
         return None
 
     def run(self, strategy: OptionStrategy, data: MarketData) -> OptionBacktestResult:

@@ -31,6 +31,7 @@
         adaptive  IV-Adaptive (IV自适应策略)
         butterfly Long Call Butterfly (蝶式策略)
         pcr_ic    PCR+VIX-Band Enhanced Iron Condor (PCR增强型铁鹰)
+        ta        TA-Driven / MACD+RSI+BB (技术分析驱动)
 """
 
 import sys
@@ -108,7 +109,7 @@ def _load_option_strategies():
     from options.strategies import (
         IronCondorStrategy, VerticalSpreadStrategy, WheelStrategy,
         StraddleStrategy, IVAdaptiveStrategy,
-        ButterflySpreadStrategy, PCREnhancedStrategy,
+        ButterflySpreadStrategy, PCREnhancedStrategy, TADrivenStrategy,
     )
 
     OPTION_STRATEGIES.update({
@@ -168,6 +169,14 @@ def _load_option_strategies():
                 "iv_rank_entry": 50.0, "dte_target": 45,
                 "short_delta": 0.16, "wing_width": 5.0,
                 "require_pcr": True, "require_vix_band": True,
+            },
+        },
+        "ta": {
+            "class": TADrivenStrategy,
+            "name": "TA-Driven (MACD/RSI/BB)",
+            "default_params": {
+                "dte_target": 30, "profit_target": 0.50,
+                "stop_loss": 0.50,
             },
         },
     })

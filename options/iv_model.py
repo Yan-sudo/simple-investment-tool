@@ -173,9 +173,10 @@ def classify_vol_regime(hv_series: List[float], lookback: int = 252) -> VolRegim
 # ── Synthetic IV Series Generation ──────────────────────────────────────────
 
 def generate_iv_series(closes: List[float], base_iv: float = 0.20,
-                       iv_mean_reversion: float = 0.05,
+                       iv_mean_reversion: float = 0.035,
                        iv_vol_of_vol: float = 0.15,
                        leverage_effect: float = -0.5,
+                       iv_premium: float = 0.03,
                        seed: Optional[int] = None) -> List[float]:
     """Generate a synthetic IV time series that behaves realistically.
 
@@ -184,6 +185,7 @@ def generate_iv_series(closes: List[float], base_iv: float = 0.20,
     - Negatively correlated with returns (leverage effect)
     - Has its own stochastic component (vol-of-vol)
     - Clusters (high vol tends to stay high)
+    - IV carries a variance risk premium over HV (typically 15-20%)
 
     Args:
         closes: Underlying closing prices
@@ -191,6 +193,7 @@ def generate_iv_series(closes: List[float], base_iv: float = 0.20,
         iv_mean_reversion: Speed of mean reversion (higher = faster)
         iv_vol_of_vol: Volatility of volatility
         leverage_effect: Correlation between returns and IV changes
+        iv_premium: Variance risk premium — IV floats above HV by this amount
         seed: Random seed
 
     Returns:
@@ -201,13 +204,15 @@ def generate_iv_series(closes: List[float], base_iv: float = 0.20,
         rng.seed(seed)
 
     n = len(closes)
-    iv_series = [base_iv] * n
+    target_iv = base_iv + iv_premium  # IV trades at a premium to realised vol
+    iv_series = [target_iv] * n
 
     for i in range(1, n):
         prev_iv = iv_series[i - 1]
 
-        # Mean reversion pull
-        mr_pull = iv_mean_reversion * (base_iv - prev_iv) / 252.0
+        # Mean reversion pull toward target (includes premium)
+        # iv_mean_reversion is daily fraction (0.035 ≈ half-life of ~20 days)
+        mr_pull = iv_mean_reversion * (target_iv - prev_iv)
 
         # Return-based component (leverage effect)
         if closes[i - 1] > 0:
